@@ -1,0 +1,8 @@
+[workspace]
+members = [
+  "crates/agent-core",
+  "crates/agent-daemon",
+  "crates/agent-ui-macos",
+  "crates/agent-ui-windows"
+]
+resolver = "2"

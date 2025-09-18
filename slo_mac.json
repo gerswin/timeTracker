@@ -1,0 +1,8 @@
+{
+  "samples": 116,
+  "interval_s": 1,
+  "duration_s": 120,
+  "cpu": {"p95": 0.13081993, "avg": 0.112, "threshold": 1.0, "ok": true},
+  "mem": {"p95": 16, "avg": 12.578, "threshold": 60, "ok": true},
+  "pass": true
+}

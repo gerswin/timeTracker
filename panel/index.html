@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RiporAgent Panel</title>
+    <link rel="stylesheet" href="/panel/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>RiporAgent Panel</h1>
+      <div id="version"></div>
+    </header>
+    <main>
+      <section>
+        <h2>Estado</h2>
+        <div class="grid">
+          <div><b>Device ID</b><div id="device_id"></div></div>
+          <div><b>Versión</b><div id="agent_version"></div></div>
+          <div><b>CPU %</b><div id="cpu_pct"></div></div>
+          <div><b>RAM MB</b><div id="mem_mb"></div></div>
+          <div><b>Idle ms</b><div id="input_idle_ms"></div></div>
+          <div><b>Actividad</b><div id="activity_state"></div></div>
+          <div><b>Eventos en cola</b><div id="queue_len"></div></div>
+          <div><b>Último evento</b><div id="last_event_ts"></div></div>
+          <div><b>Último heartbeat</b><div id="last_heartbeat_ts"></div></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Permisos (macOS)</h2>
+        <div id="perms">—</div>
+        <div class="actions">
+          <button id="btn-refresh-perms">Refrescar</button>
+          <button id="btn-prompt-perms">Solicitar permisos</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>App en foco</h2>
+        <div id="focus">—</div>
+      </section>
+
+      <section>
+        <h2>Cola (últimos 10)</h2>
+        <pre id="queue">—</pre>
+      </section>
+
+    </main>
+    <footer>
+      <span>Origen: <code id="origin"></code></span>
+      <span id="updated">—</span>
+    </footer>
+    <script src="/panel/app.js"></script>
+  </body>
+  </html>
