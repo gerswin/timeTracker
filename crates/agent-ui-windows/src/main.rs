@@ -100,7 +100,7 @@ fn load_tray_icon() -> Option<tray_icon::Icon> {
             let mut b: Option<&'static [u8]> = None;
             // Use conditional compilation to avoid hard failure when asset path missing during dev
             // If this path is wrong, set RIPOR_NO_EMBED_ICON=1 to skip embedding.
-            b = Some(include_bytes!("../../assets/icons/windows/icon.ico"));
+            b = Some(include_bytes!("../../../assets/icons/windows/icon.ico"));
             b
         };
         bytes

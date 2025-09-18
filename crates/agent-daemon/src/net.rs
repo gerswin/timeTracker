@@ -1,13 +1,13 @@
 use agent_core::metrics::MetricsHandle;
 use agent_core::paths::Paths;
 use agent_core::state::AgentState;
+use base64::Engine;
 use reqwest::Client;
 use serde::Serialize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
-use base64::Engine;
 
 #[derive(Serialize)]
 struct HeartbeatPayload<'a> {
@@ -62,7 +62,10 @@ pub async fn run_heartbeat_loop(
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Serialize)]
@@ -80,24 +83,59 @@ struct PayloadItem {
 
 pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
     let client = Client::builder().build().expect("client http");
-    let url = match std::env::var("EVENTS_URL") { Ok(u) => u, Err(_) => { info!("EVENTS_URL no configurado; skip sender"); return; } };
+    let url = match std::env::var("EVENTS_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            info!("EVENTS_URL no configurado; skip sender");
+            return;
+        }
+    };
     let mut backoff = 1u64;
     loop {
         // pequeña pausa base
         sleep(Duration::from_secs(5)).await;
-        let q = match agent_core::queue::Queue::open(paths, &state) { Ok(q) => q, Err(_) => continue };
-        let batch = match q.fetch_batch(100) { Ok(b) => b, Err(_) => vec![] };
-        if batch.is_empty() { backoff = 1; continue; }
-        let items: Vec<PayloadItem> = batch.iter().map(|(id, blob)| PayloadItem { id: *id, payload_b64: base64::engine::general_purpose::STANDARD.encode(blob) }).collect();
-        let body = EventsBatch { device_id: &state.device_id, agent_version: &state.agent_version, events: items };
+        let q = match agent_core::queue::Queue::open(paths, &state) {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+        let batch = match q.fetch_batch(100) {
+            Ok(b) => b,
+            Err(_) => vec![],
+        };
+        if batch.is_empty() {
+            backoff = 1;
+            continue;
+        }
+        let items: Vec<PayloadItem> = batch
+            .iter()
+            .map(|(id, blob)| PayloadItem {
+                id: *id,
+                payload_b64: base64::engine::general_purpose::STANDARD.encode(blob),
+            })
+            .collect();
+        let body = EventsBatch {
+            device_id: &state.device_id,
+            agent_version: &state.agent_version,
+            events: items,
+        };
         match client.post(&url).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
-                let ids: Vec<i64> = batch.iter().map(|(id,_)| *id).collect();
-                if let Ok(count) = q.delete_ids(&ids) { info!(count, "eventos enviados y eliminados de la cola"); }
+                let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
+                if let Ok(count) = q.delete_ids(&ids) {
+                    info!(count, "eventos enviados y eliminados de la cola");
+                }
                 backoff = 1;
             }
-            Ok(resp) => { warn!(status=?resp.status(), "envío de eventos falló"); sleep(Duration::from_secs(backoff)).await; backoff = (backoff*2).min(60); }
-            Err(e) => { warn!(?e, "error de red al enviar eventos"); sleep(Duration::from_secs(backoff)).await; backoff = (backoff*2).min(60); }
+            Ok(resp) => {
+                warn!(status=?resp.status(), "envío de eventos falló");
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
+            Err(e) => {
+                warn!(?e, "error de red al enviar eventos");
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
         }
     }
 }
