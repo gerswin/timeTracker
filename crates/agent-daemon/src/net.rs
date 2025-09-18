@@ -1,13 +1,15 @@
+use agent_core::auth::AgentSecrets;
 use agent_core::metrics::MetricsHandle;
 use agent_core::paths::Paths;
 use agent_core::state::AgentState;
-use base64::Engine;
 use reqwest::Client;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 #[derive(Serialize)]
 struct HeartbeatPayload<'a> {
@@ -28,7 +30,7 @@ pub async fn run_heartbeat_loop(
 ) {
     info!("iniciando loop de heartbeat (Fase 1)");
     let client = Client::builder().build().expect("client http");
-    let hb_url = std::env::var("HEARTBEAT_URL").ok();
+    let api_base = std::env::var("API_BASE_URL").ok();
     loop {
         sleep(Duration::from_secs(60)).await;
         let last_evt = last_event_ts.load(Ordering::Relaxed);
@@ -39,24 +41,35 @@ pub async fn run_heartbeat_loop(
             Ok(q) => q.queue_len().unwrap_or(0),
             Err(_) => 0,
         };
-        let m = metrics.get();
-        let payload = HeartbeatPayload {
-            device_id: &state.device_id,
-            agent_version: &state.agent_version,
-            last_event_ts: last_evt,
-            queue_len,
-            cpu_pct: m.cpu_pct,
-            mem_mb: m.mem_mb,
-        };
-        if let Some(url) = hb_url.as_deref() {
-            match client.post(url).json(&payload).send().await {
-                Ok(_) => last_heartbeat_ts.store(now_ms(), Ordering::Relaxed),
-                Err(e) => warn!(?e, "heartbeat falló"),
+        let _m = metrics.get();
+        if let Some(base) = api_base.as_deref() {
+            if let Some(secrets) = AgentSecrets::load(paths).ok().flatten() {
+                let body = serde_json::json!({
+                    "status": "running",
+                    "uptime_seconds": 0,
+                    "last_activity_ms": last_evt,
+                    "agent_version": state.agent_version,
+                });
+                let body_str = serde_json::to_string(&body).unwrap();
+                let sig = hmac_hex(&secrets.server_salt, body_str.as_bytes());
+                let url = format!("{}/v1/agents/heartbeat", base.trim_end_matches('/'));
+                match client.post(url)
+                    .header("Content-Type", "application/json")
+                    .header("Agent-Token", secrets.agent_token)
+                    .header("X-Body-HMAC", sig)
+                    .body(body_str)
+                    .send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        last_heartbeat_ts.store(now_ms(), Ordering::Relaxed);
+                    }
+                    Ok(resp) => warn!(status=?resp.status(), "heartbeat falló"),
+                    Err(e) => warn!(?e, "heartbeat error red"),
+                }
+                continue;
             }
-        } else {
-            info!(queue_len, "heartbeat local (sin URL configurada)");
-            last_heartbeat_ts.store(now_ms(), Ordering::Relaxed);
         }
+        info!(queue_len, "heartbeat local (sin API_BASE_URL o sin bootstrap)");
+        last_heartbeat_ts.store(now_ms(), Ordering::Relaxed);
     }
 }
 
@@ -68,28 +81,9 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[derive(Serialize)]
-struct EventsBatch<'a> {
-    device_id: &'a str,
-    agent_version: &'a str,
-    events: Vec<PayloadItem>,
-}
-
-#[derive(Serialize)]
-struct PayloadItem {
-    id: i64,
-    payload_b64: String,
-}
-
 pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
     let client = Client::builder().build().expect("client http");
-    let url = match std::env::var("EVENTS_URL") {
-        Ok(u) => u,
-        Err(_) => {
-            info!("EVENTS_URL no configurado; skip sender");
-            return;
-        }
-    };
+    let api_base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => { info!("API_BASE_URL no configurado; skip sender"); return; } };
     let mut backoff = 1u64;
     loop {
         // pequeña pausa base
@@ -106,19 +100,49 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
             backoff = 1;
             continue;
         }
-        let items: Vec<PayloadItem> = batch
-            .iter()
-            .map(|(id, blob)| PayloadItem {
-                id: *id,
-                payload_b64: base64::engine::general_purpose::STANDARD.encode(blob),
-            })
-            .collect();
-        let body = EventsBatch {
-            device_id: &state.device_id,
-            agent_version: &state.agent_version,
-            events: items,
-        };
-        match client.post(&url).json(&body).send().await {
+        // Require secrets for authenticated ingest
+        let secrets = match AgentSecrets::load(paths).ok().flatten() { Some(s) => s, None => { info!("sin bootstrap; skip ingest"); continue; } };
+        let mac = get_primary_mac().unwrap_or_default();
+        let os_name = std::env::consts::OS;
+        let mut events_json: Vec<serde_json::Value> = Vec::new();
+        for (_id, blob) in &batch {
+            if let Ok(evt) = serde_json::from_slice::<serde_json::Value>(blob) {
+                let app = evt.get("app_name").and_then(|v| v.as_str()).unwrap_or_default();
+                let title = evt.get("window_title").and_then(|v| v.as_str()).unwrap_or_default();
+                let ts = evt.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let idle = evt.get("input_idle_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let state_s = if idle < idle_threshold_ms() { "active" } else { "idle" };
+                events_json.push(serde_json::json!({
+                    "org_id": std::env::var("ORG_ID").ok().unwrap_or_default(),
+                    "user_email": std::env::var("USER_EMAIL").ok().unwrap_or_default(),
+                    "device_id": secrets.device_id.as_deref().unwrap_or(&state.device_id),
+                    "mac_address": mac,
+                    "os": os_name,
+                    "app_name": app,
+                    "window_title": title,
+                    "state": state_s,
+                    "timestamp_ms": ts,
+                    "dur_ms": 0,
+                    "category": "",
+                    "focus": true,
+                    "focus_start_ms": ts,
+                    "focus_end_ms": ts,
+                    "input_idle_ms": idle,
+                    "media_hint": "",
+                    "agent_version": state.agent_version,
+                }));
+            }
+        }
+        let body = serde_json::json!({ "events": events_json });
+        let body_str = serde_json::to_string(&body).unwrap();
+        let sig = hmac_hex(&secrets.server_salt, body_str.as_bytes());
+        let url = format!("{}/v1/events:ingest", api_base.trim_end_matches('/'));
+        match client.post(url)
+            .header("Content-Type", "application/json")
+            .header("Agent-Token", secrets.agent_token)
+            .header("X-Body-HMAC", sig)
+            .body(body_str)
+            .send().await {
             Ok(resp) if resp.status().is_success() => {
                 let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
                 if let Ok(count) = q.delete_ids(&ids) {
@@ -137,5 +161,64 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
                 backoff = (backoff * 2).min(60);
             }
         }
+    }
+}
+
+type HmacSha256 = Hmac<Sha256>;
+fn hmac_hex(key: &str, body: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("hmac key");
+    mac.update(body);
+    let res = mac.finalize().into_bytes();
+    hex::encode(res)
+}
+
+fn idle_threshold_ms() -> u64 {
+    std::env::var("IDLE_ACTIVE_THRESHOLD_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60_000)
+}
+
+fn get_primary_mac() -> Option<String> {
+    match mac_address::get_mac_address() {
+        Ok(Some(ma)) => Some(format!("{}", ma)),
+        _ => None,
+    }
+}
+
+pub async fn bootstrap_if_needed(paths: &Paths, state: &AgentState) {
+    if AgentSecrets::load(paths).ok().flatten().is_some() { return; }
+    let base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => { info!("API_BASE_URL no configurado; skip bootstrap"); return; } };
+    let org = match std::env::var("ORG_ID") { Ok(v) if !v.is_empty() => v, _ => { info!("ORG_ID no configurado; skip bootstrap"); return; } };
+    let user = match std::env::var("USER_EMAIL") { Ok(v) if !v.is_empty() => v, _ => { info!("USER_EMAIL no configurado; skip bootstrap"); return; } };
+    let mac = get_primary_mac().unwrap_or_default();
+    let body = serde_json::json!({
+        "org_id": org,
+        "user_email": user,
+        "mac_address": mac,
+        "agent_version": state.agent_version,
+    });
+    let url = format!("{}/v1/agents/bootstrap", base.trim_end_matches('/'));
+    let client = Client::builder().build().expect("client http");
+    match client.post(url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    let token = v.get("agentToken").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let salt = v.get("serverSalt").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let dev = v.get("deviceId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                    if !token.is_empty() && !salt.is_empty() {
+                        let secrets = AgentSecrets { agent_token: token, server_salt: salt, device_id: dev };
+                        if let Err(e) = secrets.save(paths) { warn!(?e, "no se pudo guardar secrets"); }
+                        else { info!("bootstrap ok: token guardado"); }
+                    } else {
+                        warn!(?v, "bootstrap respuesta incompleta");
+                    }
+                }
+                Err(e) => warn!(?e, "bootstrap parse fallo"),
+            }
+        }
+        Ok(resp) => warn!(status=?resp.status(), "bootstrap falló"),
+        Err(e) => warn!(?e, "bootstrap error red"),
     }
 }

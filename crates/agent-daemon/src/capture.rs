@@ -82,7 +82,6 @@ fn should_force_emit(last_ts: u64) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-#[cfg(target_os = "linux")]
 fn sample_once() -> Result<(String, String, u64)> {
     // 0) Preferir AX sistema: app enfocada (más fiable entre Spaces)
     if let Some((ax_pid, ax_name)) = ax_focused_app() {

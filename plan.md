@@ -189,10 +189,10 @@ DoD
 ---
 
 ## Backend mínimo (para coordinación)
-- [ ] `POST /v1/agents/events` (batch)
-- [ ] `POST /v1/agents/heartbeat`
-- [ ] `POST /v1/agents/bootstrap` (login del agente)
-- [ ] `GET /v1/agents/policy` (ETag)
+- [ ] `POST /v1/events:ingest` (batch; requiere Agent-Token + X-Body-HMAC)
+- [ ] `POST /v1/agents/heartbeat` (requiere Agent-Token + X-Body-HMAC)
+- [ ] `POST /v1/agents/bootstrap` (login del agente; sin auth)
+- [ ] `GET /v1/policy/{user_email}` (ETag; requiere Agent-Token)
 - [ ] `GET /v1/categories` (ETag)
 - [ ] Autenticación por tenant + `deviceId`
 
@@ -225,4 +225,3 @@ Para cada hito, añade bajo la tarea:
 - [ ] Confirmar crates permitidos y APIs por SO
 - [ ] Acordar formato final de endpoints y autenticación
 - [ ] Iniciar Fase 0 (esqueleto, panel local, cola cifrada)
-

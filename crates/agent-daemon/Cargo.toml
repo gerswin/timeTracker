@@ -18,6 +18,11 @@ base64 = "0.22"
 dotenvy = "0.15"
 sysinfo = { version = "0.30" }
 tower-http = { version = "0.5", features = ["fs"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+get_if_addrs = "0.5"
+mac_address = "1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.25"
@@ -33,5 +38,3 @@ windows = { version = "0.54", features = [
   "Win32_Foundation",
   "Win32_System_SystemInformation",
 ] }
-
-

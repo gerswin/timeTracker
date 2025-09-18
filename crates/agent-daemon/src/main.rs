@@ -188,6 +188,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Bootstrap (login) si es necesario
+    {
+        let s_paths = ctx.paths.clone();
+        let s_state = ctx.state.clone();
+        tokio::spawn(async move { net::bootstrap_if_needed(&s_paths, &s_state).await; });
+    }
+
     // lanzar tareas de captura y heartbeat antes de iniciar servidor
     info!("spawning capture and heartbeat tasks");
     println!("[debug] spawning capture/heartbeat tasks");
@@ -223,8 +230,8 @@ async fn main() -> Result<()> {
         .await;
     });
 
-    // opcional: sender de eventos si EVENTS_URL está configurado
-    if std::env::var("EVENTS_URL").is_ok() {
+    // opcional: sender de eventos si API_BASE_URL está configurado
+    if std::env::var("API_BASE_URL").is_ok() {
         let s_state = ctx.state.clone();
         let s_paths = ctx.paths.clone();
         tokio::spawn(async move {
