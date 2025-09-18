@@ -2,6 +2,23 @@
 
 Proyecto del agente de transparencia y uso para Windows 10/11, macOS 12+ y Ubuntu 20.04+.
 
+## Quick Start
+- macOS (.app bundle):
+  - Empaqueta: `APP_VERSION=0.1.1 BUNDLE_ID=com.ripor.Ripor HELPER_BUNDLE_ID=com.ripor.Ripor.LoginItem bash scripts/macos_pack.sh`
+  - Abre la app: `open dist/Ripor.app` (la UI de barra iniciará el `agent-daemon`).
+  - Verifica: `curl http://127.0.0.1:49219/healthz` y abre `http://127.0.0.1:49219/ui`.
+  - Login Item: usa el menú “Iniciar al abrir sesión”. Estado: `./target/release/agent-ui-macos --print-login-state` → `{ "sm_registered": true|false, "launchagent_present": true|false }`.
+  - Permisos: desde `http://127.0.0.1:49219/ui` pulsa “Solicitar permisos” u “Abrir Accesibilidad/Screen Recording”.
+
+- Windows (tray UI):
+  - Arranca el daemon: `set RUST_LOG=info && cargo run -p agent-daemon`.
+  - Inicia la bandeja: `cargo run -p agent-ui-windows --release`.
+  - Menú: “Ver panel” abre `http://127.0.0.1:49219/ui`, “Pausar/Reanudar”, “Iniciar al abrir sesión” (autorun en `HKCU\...\Run`).
+  - Icono: coloca `assets/icons/windows/icon.ico` (se incrusta en build). Usa `RIPOR_NO_EMBED_ICON=1` para omitir.
+
+- Variables útiles:
+  - `PANEL_ADDR=127.0.0.1:49219` (bind del panel), `IDLE_ACTIVE_THRESHOLD_MS=60000`, `RIPOR_NO_AUTO_PROMPT=1`.
+
 ## Estado actual (Fase 0)
 - Workspace Rust creado: `agent-core` (lib) y `agent-daemon` (bin).
 - Panel local en `http://127.0.0.1:49219` con endpoints mínimos.
