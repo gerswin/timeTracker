@@ -52,7 +52,7 @@ DoD (Definition of Done)
 Objetivo: capturar app/título foreground, `inputIdleMs`; heartbeats cada 60 s.
 
 Tareas
-- [ ] Windows: foreground window + título + `GetLastInputInfo`
+- [x] Windows: foreground window + título + `GetLastInputInfo`
 - [x] macOS: app foreground (NSWorkspace) + título (CGWindowList; fallback AXUIElement) + `inputIdleMs`
 - [ ] Linux: X11/Wayland (preferir Wayland si disponible; fallback X11) + idle
 - [ ] Estado `ONLINE_ACTIVE/ONLINE_IDLE` derivado de `inputIdleMs`
@@ -218,3 +218,5 @@ Para cada hito, añade bajo la tarea:
 - [ ] Confirmar crates permitidos y APIs por SO
 - [ ] Acordar formato final de endpoints y autenticación
 - [ ] Iniciar Fase 0 (esqueleto, panel local, cola cifrada)
+
+

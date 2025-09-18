@@ -29,6 +29,13 @@ try {
   Write-Host "[win_smoke] /healthz:"; Invoke-Http '/healthz' | ConvertTo-Json -Depth 5
   Write-Host "[win_smoke] /state:"; Invoke-Http '/state' | ConvertTo-Json -Depth 6
   Write-Host "[win_smoke] /queue:"; Invoke-Http '/queue' | ConvertTo-Json -Depth 6
+  $sample = Invoke-Http '/debug/sample'
+  if($sample){
+    Write-Host "[win_smoke] /debug/sample:"; $sample | ConvertTo-Json -Depth 6
+    if($sample.win_pid){
+      Write-Host "[win_smoke] foco PID:" $sample.win_pid "HWND:" $sample.win_hwnd "estrategia:" $sample.title_source
+    }
+  }
 }
 finally {
   if($p -and !$p.HasExited){ Stop-Process -Id $p.Id -Force }

@@ -26,9 +26,20 @@ async function refreshAll(){
     $('last_event_ts').textContent = fmtTs(st.last_event_ts);
     $('last_heartbeat_ts').textContent = fmtTs(st.last_heartbeat_ts);
     $('queue').textContent = json(st.queue_preview);
-    $('perms').innerHTML = st.perms && st.perms.unsupported ? 'No aplica' :
-      `<span>Accessibility: <b class="${st.perms.accessibility_ok?'ok':'bad'}">${st.perms.accessibility_ok}</b></span>
+    const permsSection = $('perms-section');
+    if(permsSection){
+      if(st.perms && st.perms.unsupported){
+        permsSection.style.display = 'none';
+      }else{
+        permsSection.style.display = '';
+        if(st.perms && typeof st.perms.accessibility_ok !== 'undefined'){
+          $('perms').innerHTML = `<span>Accessibility: <b class="${st.perms.accessibility_ok?'ok':'bad'}">${st.perms.accessibility_ok}</b></span>
        <span style="margin-left:12px">Screen Recording: <b class="${st.perms.screen_recording_ok?'ok':'bad'}">${st.perms.screen_recording_ok}</b></span>`;
+        }else{
+          $('perms').textContent = '-';
+        }
+      }
+    }
   }catch(e){ console.error('state', e); }
 
   try{
@@ -38,8 +49,28 @@ async function refreshAll(){
   }catch(e){ console.error('queue', e); }
 
   try{
-    const s = await fetchJson('/debug/sample');
-    $('focus').textContent = json({ app_name:s.app_name, title_source:s.title_source, window_title:s.window_title, cg_title:s.cg_title, ax_title:s.ax_title });
+    const sample = await fetchJson('/debug/sample');
+    if(sample && sample.unsupported){
+      $('focus').textContent = 'No disponible en este sistema';
+    }else if(sample && sample.error){
+      $('focus').textContent = 'Error: '+sample.error;
+    }else{
+      const details = {
+        app_name: 'app_name' in sample ? sample.app_name : null,
+        window_title: 'window_title' in sample ? sample.window_title : null,
+        title_source: 'title_source' in sample ? sample.title_source : null,
+        input_idle_ms: 'input_idle_ms' in sample ? sample.input_idle_ms : null,
+      };
+      if('win_pid' in sample){
+        details.win_pid = sample.win_pid != null ? sample.win_pid : null;
+        details.win_thread_id = sample.win_thread_id != null ? sample.win_thread_id : null;
+        details.win_hwnd = sample.win_hwnd != null ? sample.win_hwnd : null;
+        details.win_root_hwnd = sample.win_root_hwnd != null ? sample.win_root_hwnd : null;
+        details.win_class = sample.win_class != null ? sample.win_class : null;
+        details.win_process_path = sample.win_process_path != null ? sample.win_process_path : null;
+      }
+      $('focus').textContent = json(details);
+    }
   }catch(e){ $('focus').textContent = '—'; }
 
   $('updated').textContent = 'Actualizado: '+new Date().toLocaleTimeString();
@@ -51,4 +82,6 @@ document.addEventListener('DOMContentLoaded', ()=>{
   refreshAll();
   setInterval(refreshAll, 2000);
 });
+
+
 

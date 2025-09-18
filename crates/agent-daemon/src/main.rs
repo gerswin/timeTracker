@@ -3,25 +3,25 @@ use agent_core::paths::Paths;
 use agent_core::state::AgentState;
 use agent_core::DEFAULT_PANEL_ADDR;
 use anyhow::Result;
-use axum::extract::{State as AxumState, Query};
+use axum::extract::{Query, State as AxumState};
+use axum::response::Html;
 use axum::routing::{get, get_service};
 use axum::Json;
-use axum::response::Html;
 use axum::Router;
 // use axum::routing::get as ax_get;
-use serde::{Serialize, Deserialize};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
-use base64::Engine;
 
 mod capture;
-mod net;
 #[cfg(target_os = "macos")]
 mod macos_perms;
+mod net;
 
 #[cfg(target_os = "macos")]
 #[link(name = "AppKit", kind = "framework")]
@@ -48,7 +48,10 @@ struct AppCtx {
 }
 
 #[derive(Serialize)]
-struct Healthz { ok: bool, version: String }
+struct Healthz {
+    ok: bool,
+    version: String,
+}
 
 #[derive(Serialize)]
 struct StateDto {
@@ -76,7 +79,9 @@ async fn main() -> Result<()> {
     let paths = Paths::new()?;
     let _guard = init_tracing(&paths);
     #[cfg(target_os = "macos")]
-    unsafe { macos_load_appkit(); }
+    unsafe {
+        macos_load_appkit();
+    }
     let version = env!("CARGO_PKG_VERSION").to_string();
     let state = AgentState::load_or_init(&paths, &version)?;
 
@@ -106,31 +111,45 @@ async fn main() -> Result<()> {
         .route("/pause/clear", get(pause_clear_handler))
         .route("/permissions", get(perms_handler))
         .route("/permissions/prompt", get(perms_prompt_handler))
-        .route("/permissions/open/accessibility", get(perms_open_accessibility))
+        .route(
+            "/permissions/open/accessibility",
+            get(perms_open_accessibility),
+        )
         .route("/permissions/open/screen", get(perms_open_screen))
         .route("/debug/sample", get(debug_sample_handler))
         .route("/debug/windows", get(debug_windows_handler))
         .route("/debug/window", get(debug_windows_handler))
         .route("/debug/frontmost", get(debug_frontmost_handler));
     // Resolver carpeta de panel estático: PANEL_DIR, ./panel, o ../../panel (raíz del workspace)
-    let static_dir = std::env::var("PANEL_DIR").ok()
+    let static_dir = std::env::var("PANEL_DIR")
+        .ok()
         .map(std::path::PathBuf::from)
         .filter(|p| p.exists())
         .or_else(|| {
-            let p = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            let p = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
                 .join("panel");
-            if p.exists() { Some(p) } else { None }
+            if p.exists() {
+                Some(p)
+            } else {
+                None
+            }
         })
         .or_else(|| {
-            let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../panel");
-            if p.exists() { Some(p) } else { None }
+            let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../panel");
+            if p.exists() {
+                Some(p)
+            } else {
+                None
+            }
         });
     let base = if let Some(static_dir) = static_dir {
-        let svc = tower_http::services::ServeDir::new(static_dir)
-            .append_index_html_on_directories(true);
+        let svc =
+            tower_http::services::ServeDir::new(static_dir).append_index_html_on_directories(true);
         base.nest_service("/panel", get_service(svc))
-    } else { base };
+    } else {
+        base
+    };
     let app = base.with_state(app_ctx);
 
     // Aviso temprano de permisos en macOS para ayudar a la configuración inicial
@@ -138,7 +157,10 @@ async fn main() -> Result<()> {
     {
         let perms = crate::macos_perms::check_permissions();
         if !perms.accessibility_ok || !perms.screen_recording_ok {
-            tracing::info!(?perms, "permisos macOS incompletos; la captura de títulos puede ser limitada");
+            tracing::info!(
+                ?perms,
+                "permisos macOS incompletos; la captura de títulos puede ser limitada"
+            );
             println!(
                 "[hint] Revisa permisos en http://127.0.0.1:49219/permissions y, si falta alguno, abre http://127.0.0.1:49219/permissions/prompt"
             );
@@ -176,7 +198,14 @@ async fn main() -> Result<()> {
     let last_idle1 = ctx.last_idle_ms.clone();
     let paused1 = ctx.paused_until_ms.clone();
     tokio::spawn(async move {
-        capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1).await;
+        capture::run_capture_loop(
+            bg_state1.clone(),
+            &bg_paths1,
+            last_event1,
+            last_idle1,
+            paused1,
+        )
+        .await;
     });
     let bg_state2 = ctx.state.clone();
     let bg_paths2 = ctx.paths.clone();
@@ -184,7 +213,14 @@ async fn main() -> Result<()> {
     let last_event2 = ctx.last_event_ts.clone();
     let last_hb2 = ctx.last_heartbeat_ts.clone();
     tokio::spawn(async move {
-        net::run_heartbeat_loop(bg_state2.clone(), &bg_paths2, bg_metrics2.clone(), last_event2, last_hb2).await;
+        net::run_heartbeat_loop(
+            bg_state2.clone(),
+            &bg_paths2,
+            bg_metrics2.clone(),
+            last_event2,
+            last_hb2,
+        )
+        .await;
     });
 
     // opcional: sender de eventos si EVENTS_URL está configurado
@@ -216,7 +252,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    let server = axum::serve(listener, app.into_make_service()).with_graceful_shutdown(shutdown_signal());
+    let server =
+        axum::serve(listener, app.into_make_service()).with_graceful_shutdown(shutdown_signal());
     if let Err(e) = server.await {
         error!(?e, "falló servidor panel");
     }
@@ -224,7 +261,10 @@ async fn main() -> Result<()> {
 }
 
 async fn healthz(AxumState(ctx): AxumState<AppCtx>) -> Json<Healthz> {
-    Json(Healthz { ok: true, version: ctx.version.clone() })
+    Json(Healthz {
+        ok: true,
+        version: ctx.version.clone(),
+    })
 }
 
 async fn ui_index() -> Html<&'static str> {
@@ -255,7 +295,7 @@ async fn ui_index() -> Html<&'static str> {
       <div class="card"><div class="muted">Monitoreo</div><div id="mon"></div></div>
       <div class="card"><div class="muted">Cola</div><div id="qlen"></div></div>
     </div>
-    <div class="card" style="margin:0 16px"><div class="muted">Permisos</div><div id="perms">—</div>
+    <div class="card" id="perms-card" style="margin:0 16px"><div class="muted">Permisos</div><div id="perms">—</div>
       <div class="muted" style="margin-top:6px">Binario a autorizar:</div>
       <div><code id="agent_path"></code></div>
       <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
@@ -277,8 +317,19 @@ async fn ui_index() -> Html<&'static str> {
           document.getElementById('idle').textContent=s.input_idle_ms;
           document.getElementById('act').textContent=s.activity_state;
           document.getElementById('qlen').textContent=s.queue_len;
-          document.getElementById('perms').innerHTML = s.perms && s.perms.unsupported ? 'No aplica' :
-            'Accessibility: <b>'+s.perms.accessibility_ok+'</b> — Screen Recording: <b>'+s.perms.screen_recording_ok+'</b>';
+                    const permsCard = document.getElementById('perms-card');
+          if(permsCard){
+            if(s.perms && s.perms.unsupported){
+              permsCard.style.display='none';
+            } else {
+              permsCard.style.display='';
+              if(s.perms && typeof s.perms.accessibility_ok !== 'undefined'){
+                document.getElementById('perms').innerHTML = 'Accessibility: <b>'+s.perms.accessibility_ok+'</b> - Screen Recording: <b>'+s.perms.screen_recording_ok+'</b>';
+              } else {
+                document.getElementById('perms').textContent='-';
+              }
+            }
+          }
           document.getElementById('agent_path').textContent=s.agent_path;
           const mon = document.getElementById('mon');
           if(s.paused_until_ms && s.paused_until_ms > 0){
@@ -287,12 +338,59 @@ async fn ui_index() -> Html<&'static str> {
         }catch(e){ console.error('state', e); }
         try{const q=await j('/queue?limit=10'); document.getElementById('queue').textContent=JSON.stringify(q.top,null,2);}catch(e){ console.error('queue', e); }
         try{const f=await j('/debug/sample');
-          document.getElementById('focus').textContent=JSON.stringify({app_name:f.app_name, ax_name:f.ax_name, ns_name:f.ns_name, cg_owner:f.cg_owner, title_source:f.title_source, window_title:f.window_title, cg_title:f.cg_title, ax_title:f.ax_title},null,2);
-          const names=[f.ax_name,f.ns_name,f.cg_owner].filter(Boolean);
-          const allEq=names.length>0 && names.every(n=>n===names[0]);
-          const el=document.getElementById('focus_consistency');
-          if(allEq){ el.className='ok'; el.textContent='OK: AX/NS/CG concuerdan ('+names[0]+')'; }
-          else { el.className='warn'; el.textContent='ATENCIÓN: fuentes difieren — AX='+(f.ax_name||'—')+' / NS='+(f.ns_name||'—')+' / CG='+(f.cg_owner||'—'); }
+          const focusEl=document.getElementById('focus');
+          const consistencyEl=document.getElementById('focus_consistency');
+          if(f && f.unsupported){
+            focusEl.textContent='No disponible en este sistema';
+            consistencyEl.className='muted';
+            consistencyEl.textContent='';
+          } else if(f && f.error){
+            focusEl.textContent='Error: '+f.error;
+            consistencyEl.className='warn';
+            consistencyEl.textContent='Error al obtener foco';
+          } else {
+            if(Object.prototype.hasOwnProperty.call(f,'win_pid')){
+              const details={
+                app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
+                window_title:Object.prototype.hasOwnProperty.call(f,'window_title')?f.window_title:null,
+                title_source:Object.prototype.hasOwnProperty.call(f,'title_source')?f.title_source:null,
+                input_idle_ms:Object.prototype.hasOwnProperty.call(f,'input_idle_ms')?f.input_idle_ms:null,
+                win_pid:f.win_pid != null ? f.win_pid : null,
+                win_thread_id:f.win_thread_id != null ? f.win_thread_id : null,
+                win_hwnd:f.win_hwnd != null ? f.win_hwnd : null,
+                win_root_hwnd:f.win_root_hwnd != null ? f.win_root_hwnd : null,
+                win_class:f.win_class != null ? f.win_class : null,
+                win_process_path:f.win_process_path != null ? f.win_process_path : null,
+              };
+              focusEl.textContent=JSON.stringify(details,null,2);
+              consistencyEl.className='muted';
+              consistencyEl.textContent=f.title_source ? 'Fuente: '+f.title_source : '';
+            } else {
+              const details={
+                app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
+                window_title:Object.prototype.hasOwnProperty.call(f,'window_title')?f.window_title:null,
+                title_source:Object.prototype.hasOwnProperty.call(f,'title_source')?f.title_source:null,
+                input_idle_ms:Object.prototype.hasOwnProperty.call(f,'input_idle_ms')?f.input_idle_ms:null,
+                ax_name:f.ax_name ?? null,
+                ns_name:f.ns_name ?? null,
+                cg_owner:f.cg_owner ?? null,
+                cg_title:f.cg_title ?? null,
+                ax_title:f.ax_title ?? null,
+              };
+              focusEl.textContent=JSON.stringify(details,null,2);
+              const names=[f.ax_name,f.ns_name,f.cg_owner].filter(Boolean);
+              if(names.length>0 && names.every(n=>n===names[0])){
+                consistencyEl.className='ok';
+                consistencyEl.textContent='OK: AX/NS/CG concuerdan ('+names[0]+')';
+              } else if(names.length>0){
+                consistencyEl.className='warn';
+                consistencyEl.textContent='ATENCION: fuentes difieren - AX='+(f.ax_name||'N/A')+' / NS='+(f.ns_name||'N/A')+' / CG='+(f.cg_owner||'N/A');
+              } else {
+                consistencyEl.className='muted';
+                consistencyEl.textContent='Foco disponible (sin AX/NS/CG)';
+              }
+            }
+          }
         }catch(e){ console.error('sample', e); }
       }
       document.addEventListener('DOMContentLoaded',()=>{
@@ -348,16 +446,26 @@ async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
         paused_until_ms: ctx.paused_until_ms.load(Ordering::Relaxed),
         queue_preview,
         perms: perms_v,
-        agent_path: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+        agent_path: std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
     })
 }
 
 #[derive(Deserialize)]
-struct PauseParams { minutes: Option<u64>, ms: Option<u64> }
+struct PauseParams {
+    minutes: Option<u64>,
+    ms: Option<u64>,
+}
 
-async fn pause_handler(AxumState(ctx): AxumState<AppCtx>, Query(p): Query<PauseParams>) -> Json<serde_json::Value> {
+async fn pause_handler(
+    AxumState(ctx): AxumState<AppCtx>,
+    Query(p): Query<PauseParams>,
+) -> Json<serde_json::Value> {
     let now = now_ms();
-    let dur_ms = p.ms.or(p.minutes.map(|m| m*60_000)).unwrap_or(15*60_000);
+    let dur_ms =
+        p.ms.or(p.minutes.map(|m| m * 60_000))
+            .unwrap_or(15 * 60_000);
     let until = now.saturating_add(dur_ms);
     ctx.paused_until_ms.store(until, Ordering::Relaxed);
     Json(serde_json::json!({"ok": true, "paused_until_ms": until}))
@@ -370,7 +478,10 @@ async fn pause_clear_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<serde_js
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn derive_activity_state(idle_ms: u64) -> String {
@@ -379,7 +490,11 @@ fn derive_activity_state(idle_ms: u64) -> String {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60_000);
-    if idle_ms < threshold_ms { "ONLINE_ACTIVE".to_string() } else { "ONLINE_IDLE".to_string() }
+    if idle_ms < threshold_ms {
+        "ONLINE_ACTIVE".to_string()
+    } else {
+        "ONLINE_IDLE".to_string()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -431,9 +546,14 @@ struct QueueDto {
 }
 
 #[derive(Deserialize)]
-struct QueueParams { limit: Option<usize> }
+struct QueueParams {
+    limit: Option<usize>,
+}
 
-async fn queue_handler(AxumState(ctx): AxumState<AppCtx>, Query(params): Query<QueueParams>) -> Json<QueueDto> {
+async fn queue_handler(
+    AxumState(ctx): AxumState<AppCtx>,
+    Query(params): Query<QueueParams>,
+) -> Json<QueueDto> {
     let limit = params.limit.unwrap_or(10).min(100).max(1);
     let q = agent_core::queue::Queue::open(&ctx.paths, &ctx.state);
     let (len, items) = match q {
@@ -453,7 +573,10 @@ async fn queue_handler(AxumState(ctx): AxumState<AppCtx>, Query(params): Query<Q
         }
         Err(_) => (0, Vec::new()),
     };
-    Json(QueueDto { queue_len: len, top: items })
+    Json(QueueDto {
+        queue_len: len,
+        top: items,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -474,11 +597,44 @@ async fn debug_sample_handler() -> Json<capture::SampleDebugDto> {
             cg_title: None,
             ax_title: None,
             perms: crate::macos_perms::check_permissions(),
-        })
+        }),
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+async fn debug_sample_handler() -> Json<capture::SampleDebugDto> {
+    match capture::sample_debug() {
+        Ok(v) => Json(v),
+        Err(_) => Json(capture::SampleDebugDto {
+            app_name: String::new(),
+            window_title: String::new(),
+            input_idle_ms: 0,
+            title_source: "error".into(),
+            ax_pid: None,
+            ax_name: None,
+            ns_pid: None,
+            ns_name: None,
+            cg_pid: None,
+            cg_owner: None,
+            cg_title: None,
+            ax_title: None,
+            #[cfg(target_os = "windows")]
+            win_pid: None,
+            #[cfg(target_os = "windows")]
+            win_thread_id: None,
+            #[cfg(target_os = "windows")]
+            win_hwnd: None,
+            #[cfg(target_os = "windows")]
+            win_root_hwnd: None,
+            #[cfg(target_os = "windows")]
+            win_class: None,
+            #[cfg(target_os = "windows")]
+            win_process_path: None,
+        }),
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 async fn debug_sample_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({"unsupported": true}))
 }
