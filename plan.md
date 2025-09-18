@@ -69,10 +69,15 @@ DoD
 ---
 
 ## Fase 2 — Políticas + Exclusiones (1–2 semanas)
-Objetivo: políticas remotas con ETag; filtro antes de persistir; drop rate por regla; kill switch/pause.
+Objetivo: onboarding (login/bootstrap) y políticas remotas con ETag; filtro antes de persistir; drop rate por regla; kill switch/pause.
 
 Tareas
-- [ ] `GET /v1/agents/policy` con `If-None-Match`
+- [ ] Bootstrap/login del agente:
+  - `POST /v1/agents/bootstrap`
+    - Request JSON: `{ "macAddress": "string", "orgId": "string", "userEmail": "string" }`
+    - Response JSON: `{ "agentToken": string, "serverSalt": string, "policy": { "killSwitch": bool, "pauseCapture": bool, "titleCapture": bool, "excludeApps": [], "excludePatterns": [], "updateChannel": string, "titleSampleHz": number, "titleBurstPerMinute": number, "focusMinMinutes": number } }`
+  - Persistir `agentToken` y `serverSalt` (seguro: Keychain/DPAPI cuando aplique) y cachear `policy.json`
+- [ ] `GET /v1/agents/policy/userid` con `If-None-Match`
 - [ ] Aplicación en caliente ≤ 10 s (cache local `policy.json` + `policy_meta.json`)
 - [ ] Reglas: `excludeApps[]`, `excludePatterns[]`, `excludeExePaths[]`
 - [ ] Marcar evento excluido con `dropped_reason`
@@ -84,6 +89,7 @@ DoD
 - [ ] Títulos sensibles nunca persisten ni salen del proceso
 - [ ] Panel muestra política efectiva y versión/ETag
 - [ ] Cambios de política se reflejan ≤ 10 s
+ - [ ] Bootstrap completado y `agentToken` persistido/usable
 
 ---
 
@@ -185,6 +191,7 @@ DoD
 ## Backend mínimo (para coordinación)
 - [ ] `POST /v1/agents/events` (batch)
 - [ ] `POST /v1/agents/heartbeat`
+- [ ] `POST /v1/agents/bootstrap` (login del agente)
 - [ ] `GET /v1/agents/policy` (ETag)
 - [ ] `GET /v1/categories` (ETag)
 - [ ] Autenticación por tenant + `deviceId`
@@ -218,5 +225,4 @@ Para cada hito, añade bajo la tarea:
 - [ ] Confirmar crates permitidos y APIs por SO
 - [ ] Acordar formato final de endpoints y autenticación
 - [ ] Iniciar Fase 0 (esqueleto, panel local, cola cifrada)
-
 
