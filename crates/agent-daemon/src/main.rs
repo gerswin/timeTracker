@@ -19,6 +19,7 @@ use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
 
 mod capture;
+mod policy;
 #[cfg(target_os = "macos")]
 mod macos_perms;
 mod net;
@@ -45,6 +46,8 @@ struct AppCtx {
     last_heartbeat_ts: Arc<AtomicU64>,
     last_idle_ms: Arc<AtomicU64>,
     paused_until_ms: Arc<AtomicU64>,
+    policy_rt: std::sync::Arc<policy::PolicyRuntime>,
+    dropped_events: Arc<AtomicU64>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +71,9 @@ struct StateDto {
     queue_preview: Vec<serde_json::Value>,
     perms: serde_json::Value,
     agent_path: String,
+    policy: serde_json::Value,
+    policy_etag: Option<String>,
+    dropped_events: u64,
 }
 
 // Usamos runtime de un solo hilo para garantizar que las llamadas a AppKit/AX
@@ -98,6 +104,8 @@ async fn main() -> Result<()> {
         last_heartbeat_ts: Arc::new(AtomicU64::new(0)),
         last_idle_ms: Arc::new(AtomicU64::new(0)),
         paused_until_ms: Arc::new(AtomicU64::new(0)),
+        policy_rt: policy::PolicyRuntime::new(),
+        dropped_events: Arc::new(AtomicU64::new(0)),
     };
 
     let app_ctx = ctx.clone();
@@ -204,16 +212,9 @@ async fn main() -> Result<()> {
     let last_event1 = ctx.last_event_ts.clone();
     let last_idle1 = ctx.last_idle_ms.clone();
     let paused1 = ctx.paused_until_ms.clone();
-    tokio::spawn(async move {
-        capture::run_capture_loop(
-            bg_state1.clone(),
-            &bg_paths1,
-            last_event1,
-            last_idle1,
-            paused1,
-        )
-        .await;
-    });
+    let pol1 = ctx.policy_rt.clone();
+    let dropped1 = ctx.dropped_events.clone();
+    tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1).await; });
     let bg_state2 = ctx.state.clone();
     let bg_paths2 = ctx.paths.clone();
     let bg_metrics2 = ctx.metrics.clone();
@@ -237,6 +238,10 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             net::run_sender_loop(s_state.clone(), &s_paths).await;
         });
+        // policy fetch loop
+        let p_paths = ctx.paths.clone();
+        let prt = ctx.policy_rt.clone();
+        tokio::spawn(async move { net::run_policy_loop(&p_paths, prt).await; });
     }
 
     let addr_str = std::env::var("PANEL_ADDR").unwrap_or_else(|_| DEFAULT_PANEL_ADDR.to_string());
@@ -453,9 +458,10 @@ async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
         paused_until_ms: ctx.paused_until_ms.load(Ordering::Relaxed),
         queue_preview,
         perms: perms_v,
-        agent_path: std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
+        agent_path: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+        policy: serde_json::to_value(ctx.policy_rt.get().policy).unwrap_or(serde_json::json!({})),
+        policy_etag: ctx.policy_rt.get().etag,
+        dropped_events: ctx.dropped_events.load(Ordering::Relaxed),
     })
 }
 

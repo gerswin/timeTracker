@@ -42,6 +42,14 @@ impl Paths {
     pub fn secrets_file(&self) -> PathBuf {
         self.data_dir.join("agent_secrets.json")
     }
+
+    pub fn policy_file(&self) -> PathBuf {
+        self.data_dir.join("policy.json")
+    }
+
+    pub fn policy_meta_file(&self) -> PathBuf {
+        self.data_dir.join("policy_meta.json")
+    }
 }
 
 pub fn ensure_parent(p: &Path) -> Result<()> {

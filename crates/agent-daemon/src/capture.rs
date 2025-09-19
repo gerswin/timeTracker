@@ -2,6 +2,8 @@ use agent_core::queue::Queue;
 use agent_core::state::AgentState;
 use anyhow::Result;
 use serde::Serialize;
+use crate::policy::{PolicyRuntime, PolicyState};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +25,8 @@ pub async fn run_capture_loop(
     last_event_ts: Arc<AtomicU64>,
     last_idle_ms: Arc<AtomicU64>,
     paused_until_ms: Arc<AtomicU64>,
+    policy_rt: std::sync::Arc<PolicyRuntime>,
+    dropped_counter: Arc<AtomicU64>,
 ) {
     info!("iniciando loop de captura (Fase 1)");
     println!("[debug] capture loop started");
@@ -40,14 +44,22 @@ pub async fn run_capture_loop(
             Ok((app, title, idle_ms)) => {
                 last_idle_ms.store(idle_ms, Ordering::Relaxed);
                 debug!(app = ?app, title = ?title, idle_ms, "sample actual");
+                // Apply policy filters
+                let pol = policy_rt.get();
+                if should_drop(&pol, &app, &title) {
+                    dropped_counter.fetch_add(1, Ordering::Relaxed);
+                    sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+                let effective_title = if pol.policy.titleCapture { title.clone() } else { String::new() };
                 // Emitir solo en cambio o cada 30s
-                let changed = app != prev_app || title != prev_title;
+                let changed = app != prev_app || effective_title != prev_title;
                 let force_emit = should_force_emit(last_event_ts.load(Ordering::Relaxed));
                 if changed || force_emit {
                     let evt = CaptureEvent {
                         ts_ms: now_ms(),
                         app_name: app.clone(),
-                        window_title: title.clone(),
+                        window_title: effective_title.clone(),
                         input_idle_ms: idle_ms,
                     };
                     debug!("abriendo queue para enqueue");
@@ -62,7 +74,7 @@ pub async fn run_capture_loop(
                         warn!("falló abrir cola");
                     }
                     prev_app = app;
-                    prev_title = title;
+                    prev_title = effective_title;
                 }
             }
             Err(e) => {
@@ -79,6 +91,20 @@ fn should_force_emit(last_ts: u64) -> bool {
     }
     let now = now_ms();
     now.saturating_sub(last_ts) > 30_000
+}
+
+fn should_drop(pol: &PolicyState, app: &str, title: &str) -> bool {
+    let p = &pol.policy;
+    if p.killSwitch || p.pauseCapture { return true; }
+    if !p.excludeApps.is_empty() && p.excludeApps.iter().any(|a| a == app) { return true; }
+    if !p.excludePatterns.is_empty() {
+        let mut b = GlobSetBuilder::new();
+        for pat in &p.excludePatterns {
+            if let Ok(g) = Glob::new(pat) { b.add(g); }
+        }
+        if let Ok(gs) = b.build() { if gs.is_match(title) { return true; } }
+    }
+    false
 }
 
 #[cfg(target_os = "macos")]

@@ -10,6 +10,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{info, warn, debug};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use crate::policy::{PolicyRuntime, PolicyState, load_policy, save_policy};
 
 #[derive(Serialize)]
 struct HeartbeatPayload<'a> {
@@ -296,5 +297,56 @@ async fn rebootstrap(paths: &Paths, state: &AgentState) -> Option<AgentSecrets> 
         }
         Ok(resp) => { warn!(status=?resp.status(), "re-bootstrap falló"); None }
         Err(e) => { warn!(?e, "re-bootstrap error red"); None }
+    }
+}
+
+pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
+    // load initial from disk
+    let initial = load_policy(paths);
+    rt.set(initial.clone());
+    let client = Client::builder().build().expect("client http");
+    loop {
+        let base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => { sleep(Duration::from_secs(60)).await; continue; } };
+        let user = match std::env::var("USER_EMAIL") { Ok(v) if !v.is_empty() => v, _ => { sleep(Duration::from_secs(60)).await; continue; } };
+        // secrets required
+        let secrets = match AgentSecrets::load(paths).ok().flatten() { Some(s) => s, None => { sleep(Duration::from_secs(30)).await; continue; } };
+        let url = format!("{}/v1/policy/{}", base.trim_end_matches('/'), urlencoding::encode(&user));
+        let etag = rt.get().etag;
+        let mut req = client.get(url).header("Agent-Token", secrets.agent_token);
+        if let Some(tag) = etag.as_deref() { req = req.header("If-None-Match", tag); }
+        match req.send().await {
+            Ok(resp) if resp.status().as_u16() == 304 => { /* unchanged */ }
+            Ok(resp) if resp.status().is_success() => {
+                let hdr = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+                match resp.json::<serde_json::Value>().await {
+                    Ok(v) => {
+                        // soporta respuesta con campo policy o directamente la policy rica
+                        let polv = v.get("policy").cloned().unwrap_or(v);
+                        match serde_json::from_value::<crate::policy::Policy>(polv) {
+                            Ok(policy) => {
+                                let st = PolicyState { policy, etag: hdr };
+                                if let Err(e) = save_policy(paths, &st) { warn!(?e, "no se pudo guardar policy"); }
+                                rt.set(st);
+                                info!("policy actualizada");
+                            }
+                            Err(e) => warn!(?e, "parse policy fallo"),
+                        }
+                    }
+                    Err(e) => warn!(?e, "parse json en policy fallo"),
+                }
+            }
+            Ok(resp) if resp.status().as_u16() == 401 => {
+                // try rebootstrap then retry once
+                if let Some(ns) = rebootstrap(paths, &AgentState { device_id: String::new(), agent_version: String::new(), created_at: 0, updated_at: 0 }).await {
+                    let url2 = format!("{}/v1/policy/{}", base.trim_end_matches('/'), urlencoding::encode(&user));
+                    let mut r2 = client.get(url2).header("Agent-Token", ns.agent_token);
+                    if let Some(tag) = etag.as_deref() { r2 = r2.header("If-None-Match", tag); }
+                    let _ = r2.send().await; // siguiente ciclo parseará
+                }
+            }
+            Ok(resp) => warn!(status=?resp.status(), "policy fallo"),
+            Err(e) => warn!(?e, "policy error red"),
+        }
+        sleep(Duration::from_secs(300)).await;
     }
 }
