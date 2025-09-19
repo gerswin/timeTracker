@@ -27,6 +27,7 @@ pub async fn run_capture_loop(
     paused_until_ms: Arc<AtomicU64>,
     policy_rt: std::sync::Arc<PolicyRuntime>,
     dropped_counter: Arc<AtomicU64>,
+    drop_counters: Arc<crate::policy::DropCounters>,
 ) {
     info!("iniciando loop de captura (Fase 1)");
     println!("[debug] capture loop started");
@@ -49,8 +50,15 @@ pub async fn run_capture_loop(
                 // Apply policy filters
                 let pol = policy_rt.get();
                 thr.update_from_policy(&pol.policy);
-                if should_drop(&pol, &app, &title) {
+                if let Some(reason) = drop_reason(&pol, &app, &title) {
                     dropped_counter.fetch_add(1, Ordering::Relaxed);
+                    match reason {
+                        DropReason::KillSwitch => drop_counters.kill_switch.fetch_add(1, Ordering::Relaxed),
+                        DropReason::PauseCapture => drop_counters.pause.fetch_add(1, Ordering::Relaxed),
+                        DropReason::ExcludedApp => drop_counters.excluded_app.fetch_add(1, Ordering::Relaxed),
+                        DropReason::ExcludedPattern => drop_counters.excluded_pattern.fetch_add(1, Ordering::Relaxed),
+                        DropReason::Throttled => drop_counters.throttled.fetch_add(1, Ordering::Relaxed),
+                    };
                     sleep(Duration::from_millis(1000)).await;
                     continue;
                 }
@@ -61,6 +69,7 @@ pub async fn run_capture_loop(
                 if changed || force_emit {
                     if !thr.permit(now) {
                         dropped_counter.fetch_add(1, Ordering::Relaxed);
+                        drop_counters.throttled.fetch_add(1, Ordering::Relaxed);
                         // Throttled: no emit this tick
                         sleep(Duration::from_millis(1000)).await;
                         continue;
@@ -102,18 +111,22 @@ fn should_force_emit(last_ts: u64) -> bool {
     now.saturating_sub(last_ts) > 30_000
 }
 
-fn should_drop(pol: &PolicyState, app: &str, title: &str) -> bool {
+#[derive(Copy, Clone)]
+enum DropReason { KillSwitch, PauseCapture, ExcludedApp, ExcludedPattern, Throttled }
+
+fn drop_reason(pol: &PolicyState, app: &str, title: &str) -> Option<DropReason> {
     let p = &pol.policy;
-    if p.killSwitch || p.pauseCapture { return true; }
-    if !p.excludeApps.is_empty() && p.excludeApps.iter().any(|a| a == app) { return true; }
+    if p.killSwitch { return Some(DropReason::KillSwitch); }
+    if p.pauseCapture { return Some(DropReason::PauseCapture); }
+    if !p.excludeApps.is_empty() && p.excludeApps.iter().any(|a| a == app) { return Some(DropReason::ExcludedApp); }
     if !p.excludePatterns.is_empty() {
         let mut b = GlobSetBuilder::new();
         for pat in &p.excludePatterns {
             if let Ok(g) = Glob::new(pat) { b.add(g); }
         }
-        if let Ok(gs) = b.build() { if gs.is_match(title) { return true; } }
+        if let Ok(gs) = b.build() { if gs.is_match(title) { return Some(DropReason::ExcludedPattern); } }
     }
-    false
+    None
 }
 
 struct Throttle {

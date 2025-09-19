@@ -63,3 +63,11 @@ pub fn save_policy(paths: &agent_core::paths::Paths, st: &PolicyState) -> Result
     Ok(())
 }
 
+#[derive(Debug, Default)]
+pub struct DropCounters {
+    pub kill_switch: std::sync::atomic::AtomicU64,
+    pub pause: std::sync::atomic::AtomicU64,
+    pub excluded_app: std::sync::atomic::AtomicU64,
+    pub excluded_pattern: std::sync::atomic::AtomicU64,
+    pub throttled: std::sync::atomic::AtomicU64,
+}

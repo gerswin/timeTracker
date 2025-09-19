@@ -48,6 +48,7 @@ struct AppCtx {
     paused_until_ms: Arc<AtomicU64>,
     policy_rt: std::sync::Arc<policy::PolicyRuntime>,
     dropped_events: Arc<AtomicU64>,
+    drop_counters: std::sync::Arc<policy::DropCounters>,
 }
 
 #[derive(Serialize)]
@@ -74,6 +75,7 @@ struct StateDto {
     policy: serde_json::Value,
     policy_etag: Option<String>,
     dropped_events: u64,
+    dropped_by_reason: serde_json::Value,
 }
 
 // Usamos runtime de un solo hilo para garantizar que las llamadas a AppKit/AX
@@ -106,6 +108,7 @@ async fn main() -> Result<()> {
         paused_until_ms: Arc::new(AtomicU64::new(0)),
         policy_rt: policy::PolicyRuntime::new(),
         dropped_events: Arc::new(AtomicU64::new(0)),
+        drop_counters: std::sync::Arc::new(policy::DropCounters::default()),
     };
 
     let app_ctx = ctx.clone();
@@ -214,7 +217,8 @@ async fn main() -> Result<()> {
     let paused1 = ctx.paused_until_ms.clone();
     let pol1 = ctx.policy_rt.clone();
     let dropped1 = ctx.dropped_events.clone();
-    tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1).await; });
+    let dropc1 = ctx.drop_counters.clone();
+    tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1, dropc1).await; });
     let bg_state2 = ctx.state.clone();
     let bg_paths2 = ctx.paths.clone();
     let bg_metrics2 = ctx.metrics.clone();
@@ -516,6 +520,7 @@ async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
     #[cfg(not(target_os = "macos"))]
     let perms_v = serde_json::json!({"unsupported": true});
 
+    let dc = &ctx.drop_counters;
     Json(StateDto {
         device_id: ctx.state.device_id.clone(),
         agent_version: ctx.state.agent_version.clone(),
@@ -533,6 +538,13 @@ async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
         policy: serde_json::to_value(ctx.policy_rt.get().policy).unwrap_or(serde_json::json!({})),
         policy_etag: ctx.policy_rt.get().etag,
         dropped_events: ctx.dropped_events.load(Ordering::Relaxed),
+        dropped_by_reason: serde_json::json!({
+            "killSwitch": dc.kill_switch.load(Ordering::Relaxed),
+            "pauseCapture": dc.pause.load(Ordering::Relaxed),
+            "excludedApp": dc.excluded_app.load(Ordering::Relaxed),
+            "excludedPattern": dc.excluded_pattern.load(Ordering::Relaxed),
+            "throttled": dc.throttled.load(Ordering::Relaxed),
+        }),
     })
 }
 

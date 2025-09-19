@@ -78,17 +78,18 @@ Tareas
     - Response JSON: `{ "agentToken": string, "serverSalt": string, "deviceId": string }`
   - Persistir `agentToken` y `serverSalt` (seguro: Keychain/DPAPI cuando aplique) y cachear `policy.json`
   - Reintento automático en 401 (re-bootstrap one‑shot y reenvío)
-- [ ] `GET /v1/agents/policy/userid` con `If-None-Match`
-- [ ] Aplicación en caliente ≤ 10 s (cache local `policy.json` + `policy_meta.json`)
-- [ ] Reglas: `excludeApps[]`, `excludePatterns[]`, `excludeExePaths[]`
+- [x] `GET /v1/policy/{user_email}` con `If-None-Match` + ETag
+- [x] Aplicación en caliente ≤ 10 s (cache local `policy.json` + `policy_meta.json`)
+- [x] Reglas: `excludeApps[]`, `excludePatterns[]` (en captura)
 - [ ] Marcar evento excluido con `dropped_reason`
-- [ ] Telemetría: `events_dropped/s` por regla
-- [ ] `killSwitch` y `pauseCapture` respetados (heartbeats siguen activos)
+- [x] Telemetría: `dropped_events` total y por razón (throttled/excluded/pause/killSwitch)
+- [x] `killSwitch` y `pauseCapture` respetados (heartbeats siguen activos)
 - [ ] CLI: `agent policy show|pull`
+- [x] Panel/UI: mostrar política efectiva (ETag + JSON) y contadores de descartes
 
 DoD
 - [ ] Títulos sensibles nunca persisten ni salen del proceso
-- [ ] Panel muestra política efectiva y versión/ETag
+- [x] Panel muestra política efectiva y versión/ETag
 - [ ] Cambios de política se reflejan ≤ 10 s
  - [x] Bootstrap completado y `agentToken` persistido/usable
 

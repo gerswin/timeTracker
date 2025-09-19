@@ -29,6 +29,8 @@ async function refreshAll(){
     $('policy_etag').textContent = st.policy_etag || '';
     $('dropped').textContent = String(st.dropped_events || 0);
     $('policy').textContent = json(st.policy || {});
+    const dbr = document.getElementById('dropped_by_reason');
+    if(dbr){ dbr.textContent = json(st.dropped_by_reason || {}); }
     const permsSection = $('perms-section');
     if(permsSection){
       if(st.perms && st.perms.unsupported){
@@ -85,5 +87,4 @@ document.addEventListener('DOMContentLoaded', ()=>{
   refreshAll();
   setInterval(refreshAll, 2000);
 });
-
 
