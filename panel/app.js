@@ -47,6 +47,29 @@ async function refreshAll(){
         }
       }
     }
+
+    // Render focus blocks table
+    const ft = document.getElementById('focus_table');
+    if(ft){
+      try{
+        const res = await fetchJson('/focus/blocks?limit=10');
+        const items = res.items || [];
+        const tbody = ft.querySelector('tbody');
+        tbody.innerHTML = '';
+        for(const b of items){
+          const tr = document.createElement('tr');
+          const tdA = document.createElement('td'); tdA.textContent = b.app_name||''; tr.appendChild(tdA);
+          const tdT = document.createElement('td'); tdT.textContent = b.window_title||''; tr.appendChild(tdT);
+          const tdS = document.createElement('td'); tdS.style.textAlign='right'; tdS.textContent = new Date(Number(b.start_ms||0)).toLocaleTimeString(); tr.appendChild(tdS);
+          const tdE = document.createElement('td'); tdE.style.textAlign='right'; tdE.textContent = new Date(Number(b.end_ms||0)).toLocaleTimeString(); tr.appendChild(tdE);
+          const tdD = document.createElement('td'); tdD.style.textAlign='right';
+          const d = Number(b.dur_ms||0); const mm = Math.floor(d/60000); const ss = Math.floor((d%60000)/1000).toString().padStart(2,'0');
+          tdD.textContent = `${mm}:${ss}`; tr.appendChild(tdD);
+          tbody.appendChild(tr);
+        }
+      }catch(e){ /* ignore */ }
+    }
+
   }catch(e){ console.error('state', e); }
 
   try{

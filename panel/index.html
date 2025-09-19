@@ -59,7 +59,15 @@
 
       <section>
         <h2>Bloques de Focus (recientes)</h2>
-        <pre id="focus_blocks">—</pre>
+        <div style="overflow:auto">
+          <table id="focus_table" class="table" style="width:100%;border-collapse:collapse">
+            <thead>
+              <tr><th style="text-align:left">App</th><th style="text-align:left">Título</th><th style="text-align:right">Inicio</th><th style="text-align:right">Fin</th><th style="text-align:right">Duración</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <pre id="focus_blocks" style="display:none">—</pre>
       </section>
 
     </main>

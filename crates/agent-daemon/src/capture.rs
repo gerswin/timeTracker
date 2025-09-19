@@ -159,6 +159,17 @@ pub async fn run_capture_loop(
                                 });
                                 let _ = q.enqueue_json(serde_json::to_string(&fb).unwrap().as_bytes());
                             }
+                            // Persistir bloque en storage
+                            if let Ok(store) = agent_core::focus::FocusStore::open(paths) {
+                                let _ = store.insert_block(&agent_core::focus::FocusBlockRow {
+                                    start_ms: block.start_ms as i64,
+                                    end_ms: block.end_ms as i64,
+                                    dur_ms: block.dur_ms as i64,
+                                    app_name: block.app_name.clone(),
+                                    window_title: block.window_title.clone(),
+                                });
+                                let _ = store.prune_older_than(1000);
+                            }
                         }
                     }
                     debug!("abriendo queue para enqueue");

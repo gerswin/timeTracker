@@ -138,7 +138,8 @@ async fn main() -> Result<()> {
         .route("/debug/window", get(debug_windows_handler))
         .route("/debug/frontmost", get(debug_frontmost_handler))
         .route("/policy/apply", post(policy_apply_handler))
-        .route("/policy/refresh", post(policy_refresh_handler));
+        .route("/policy/refresh", post(policy_refresh_handler))
+        .route("/focus/blocks", get(focus_blocks_handler));
     // Resolver carpeta de panel estático: PANEL_DIR, ./panel, o ../../panel (raíz del workspace)
     let static_dir = std::env::var("PANEL_DIR")
         .ok()
@@ -594,6 +595,43 @@ async fn policy_refresh_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<serde
     let rt = ctx.policy_rt.clone();
     tokio::spawn(async move { crate::net::fetch_policy_once(&p, rt).await; });
     Json(serde_json::json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+struct FocusParams { limit: Option<usize>, min_minutes: Option<u32> }
+
+async fn focus_blocks_handler(AxumState(ctx): AxumState<AppCtx>, Query(p): Query<FocusParams>) -> Json<serde_json::Value> {
+    let limit = p.limit.unwrap_or(10).min(100);
+    let min_m = p.min_minutes.unwrap_or_else(|| ctx.policy_rt.get().policy.focusMinMinutes.unwrap_or(5));
+    let mut items_json = Vec::new();
+    if let Ok(store) = agent_core::focus::FocusStore::open(&ctx.paths) {
+        if let Ok(rows) = store.list_recent(limit, 0) {
+            for r in rows {
+                if (r.dur_ms as u64) >= (min_m as u64).saturating_mul(60_000) {
+                    items_json.push(serde_json::json!({
+                        "app_name": r.app_name,
+                        "window_title": r.window_title,
+                        "start_ms": r.start_ms,
+                        "end_ms": r.end_ms,
+                        "dur_ms": r.dur_ms,
+                    }));
+                }
+            }
+        }
+    }
+    if items_json.is_empty() {
+        let prev = ctx.focus_agg.recent(limit, min_m);
+        for b in prev {
+            items_json.push(serde_json::json!({
+                "app_name": b.app_name,
+                "window_title": b.window_title,
+                "start_ms": b.start_ms as i64,
+                "end_ms": b.end_ms as i64,
+                "dur_ms": b.dur_ms as i64,
+            }));
+        }
+    }
+    Json(serde_json::json!({"items": items_json}))
 }
 
 #[derive(Deserialize)]
