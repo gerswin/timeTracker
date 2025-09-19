@@ -55,7 +55,7 @@ Tareas
 - [x] Windows: foreground window + título + `GetLastInputInfo`
 - [x] macOS: app foreground (NSWorkspace) + título (CGWindowList; fallback AXUIElement) + `inputIdleMs`
 - [ ] Linux: X11/Wayland (preferir Wayland si disponible; fallback X11) + idle
-- [ ] Estado `ONLINE_ACTIVE/ONLINE_IDLE` derivado de `inputIdleMs`
+- [x] Estado `ONLINE_ACTIVE/ONLINE_IDLE` derivado de `inputIdleMs`
 - [x] Heartbeat cada 60 s (canal independiente de la cola)
 - [x] Batch sender con backoff (opcional, activado por `EVENTS_URL`)
 - [x] Endpoint panel `/queue` con preview de cola
@@ -72,11 +72,12 @@ DoD
 Objetivo: onboarding (login/bootstrap) y políticas remotas con ETag; filtro antes de persistir; drop rate por regla; kill switch/pause.
 
 Tareas
-- [ ] Bootstrap/login del agente:
+- [x] Bootstrap/login del agente:
   - `POST /v1/agents/bootstrap`
-    - Request JSON: `{ "macAddress": "string", "orgId": "string", "userEmail": "string" }`
-    - Response JSON: `{ "agentToken": string, "serverSalt": string, "policy": { "killSwitch": bool, "pauseCapture": bool, "titleCapture": bool, "excludeApps": [], "excludePatterns": [], "updateChannel": string, "titleSampleHz": number, "titleBurstPerMinute": number, "focusMinMinutes": number } }`
+    - Request JSON: `{ "org_id": "string", "user_email": "string", "mac_address": "string", "agent_version": "string" }`
+    - Response JSON: `{ "agentToken": string, "serverSalt": string, "deviceId": string }`
   - Persistir `agentToken` y `serverSalt` (seguro: Keychain/DPAPI cuando aplique) y cachear `policy.json`
+  - Reintento automático en 401 (re-bootstrap one‑shot y reenvío)
 - [ ] `GET /v1/agents/policy/userid` con `If-None-Match`
 - [ ] Aplicación en caliente ≤ 10 s (cache local `policy.json` + `policy_meta.json`)
 - [ ] Reglas: `excludeApps[]`, `excludePatterns[]`, `excludeExePaths[]`
@@ -89,7 +90,7 @@ DoD
 - [ ] Títulos sensibles nunca persisten ni salen del proceso
 - [ ] Panel muestra política efectiva y versión/ETag
 - [ ] Cambios de política se reflejan ≤ 10 s
- - [ ] Bootstrap completado y `agentToken` persistido/usable
+ - [x] Bootstrap completado y `agentToken` persistido/usable
 
 ---
 
@@ -189,9 +190,9 @@ DoD
 ---
 
 ## Backend mínimo (para coordinación)
-- [ ] `POST /v1/events:ingest` (batch; requiere Agent-Token + X-Body-HMAC)
-- [ ] `POST /v1/agents/heartbeat` (requiere Agent-Token + X-Body-HMAC)
-- [ ] `POST /v1/agents/bootstrap` (login del agente; sin auth)
+- [x] `POST /v1/events:ingest` (batch; requiere Agent-Token + X-Body-HMAC)
+- [x] `POST /v1/agents/heartbeat` (requiere Agent-Token + X-Body-HMAC)
+- [x] `POST /v1/agents/bootstrap` (login del agente; sin auth)
 - [ ] `GET /v1/policy/{user_email}` (ETag; requiere Agent-Token)
 - [ ] `GET /v1/categories` (ETag)
 - [ ] Autenticación por tenant + `deviceId`
