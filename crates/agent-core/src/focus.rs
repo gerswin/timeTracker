@@ -74,3 +74,38 @@ impl FocusStore {
         Ok(deleted)
     }
 }
+
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FocusAggregateRow {
+    pub day: String,
+    pub app_name: String,
+    pub dur_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+impl FocusStore {
+    pub fn aggregate_last_days_by_app(&self, days: u32) -> anyhow::Result<Vec<FocusAggregateRow>> {
+        let cutoff = now_ms() - (days as i64) * 86_400_000;
+        let mut stmt = self.conn.prepare(
+            "SELECT date(end_ms/1000,'unixepoch') AS day, app_name, SUM(dur_ms) AS total_dur
+             FROM focus_blocks
+             WHERE end_ms >= ?1
+             GROUP BY day, app_name
+             ORDER BY day DESC, total_dur DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cutoff], |row| {
+            Ok(FocusAggregateRow { day: row.get(0)?, app_name: row.get(1)?, dur_ms: row.get(2)? })
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+}

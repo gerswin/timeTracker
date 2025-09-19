@@ -6,6 +6,8 @@ use anyhow::Result;
 use axum::extract::{Query, State as AxumState};
 use axum::response::Html;
 use axum::routing::{get, get_service, post};
+use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
 use axum::Json;
 use axum::Router;
 // use axum::routing::get as ax_get;
@@ -139,7 +141,9 @@ async fn main() -> Result<()> {
         .route("/debug/frontmost", get(debug_frontmost_handler))
         .route("/policy/apply", post(policy_apply_handler))
         .route("/policy/refresh", post(policy_refresh_handler))
-        .route("/focus/blocks", get(focus_blocks_handler));
+        .route("/focus/blocks", get(focus_blocks_handler))
+        .route("/focus/aggregate", get(focus_aggregate_handler))
+        .route("/focus/aggregate.csv", get(focus_aggregate_csv_handler));
     // Resolver carpeta de panel estático: PANEL_DIR, ./panel, o ../../panel (raíz del workspace)
     let static_dir = std::env::var("PANEL_DIR")
         .ok()
@@ -632,6 +636,46 @@ async fn focus_blocks_handler(AxumState(ctx): AxumState<AppCtx>, Query(p): Query
         }
     }
     Json(serde_json::json!({"items": items_json}))
+}
+
+#[derive(Deserialize)]
+struct FocusAggParams { days: Option<u32> }
+
+async fn focus_aggregate_handler(AxumState(ctx): AxumState<AppCtx>, Query(p): Query<FocusAggParams>) -> Json<serde_json::Value> {
+    let days = p.days.unwrap_or(7).min(90);
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    if let Ok(store) = agent_core::focus::FocusStore::open(&ctx.paths) {
+        if let Ok(rows) = store.aggregate_last_days_by_app(days) {
+            for r in rows { items.push(serde_json::json!({"day": r.day, "app_name": r.app_name, "dur_ms": r.dur_ms})); }
+        }
+    }
+    Json(serde_json::json!({"days": days, "items": items}))
+}
+
+async fn focus_aggregate_csv_handler(AxumState(ctx): AxumState<AppCtx>, Query(p): Query<FocusAggParams>) -> impl IntoResponse {
+    let days = p.days.unwrap_or(7).min(90);
+    let mut rows: Vec<(String, String, i64)> = Vec::new();
+    if let Ok(store) = agent_core::focus::FocusStore::open(&ctx.paths) {
+        if let Ok(items) = store.aggregate_last_days_by_app(days) {
+            for r in items { rows.push((r.day, r.app_name, r.dur_ms)); }
+        }
+    }
+    let mut csv = String::new();
+    csv.push_str("day,app_name,dur_ms,dur_hhmm\n");
+    for (day, app, dur_ms) in rows {
+        let mm = (dur_ms / 60000).max(0);
+        let ss = ((dur_ms % 60000) / 1000).abs();
+        csv.push_str(&format!("{},{},{},{}:{:02}\n", day, escape_csv(&app), dur_ms, mm, ss));
+    }
+    ([ (CONTENT_TYPE, "text/csv; charset=utf-8") ], csv)
+}
+
+fn escape_csv(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        let mut out = String::from("\"");
+        for ch in s.chars() { if ch == '"' { out.push('"'); } out.push(ch); }
+        out.push('"'); out
+    } else { s.to_string() }
 }
 
 #[derive(Deserialize)]
