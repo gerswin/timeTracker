@@ -105,13 +105,19 @@ Tareas
 - [ ] `appCategories.sqlite` embebida (hash exe/bundleId → categoría)
 - [ ] Sync diferencial con `GET /v1/categories` (ETag)
 - [ ] Campo `category` en cada evento (fallback `Uncategorized`)
-- [ ] Agregador de focus: consolidar bloques si app+title constantes > `focusMinMinutes`
-- [ ] Política `focusMinMinutes` (default 5)
+- [x] Agregador de focus: consolidar bloques si app+title constantes > `focusMinMinutes`
+- [x] Política `focusMinMinutes` (default 5)
+- [x] Persistencia de bloques en SQLite (`focus_blocks`) + prune
+- [x] Endpoint `/focus/blocks?limit=N[&min_minutes=M]`
+- [x] Endpoint `/focus/aggregate?days=N` (sumas por día y app)
+- [x] UI tabla de bloques recientes (app/título/inicio/fin/duración)
+- [ ] Export CSV de agregados: `/focus/aggregate.csv?days=N`
 
 DoD
 - [ ] Bloques de focus sin huecos en ráfagas y switching rápido
 - [ ] `category` presente en eventos
-- [ ] Panel lista últimos bloques de focus
+- [x] Panel lista últimos bloques de focus + sumas por día/app
+- [ ] Export CSV disponible para analítica
 
 ---
 
