@@ -56,14 +56,28 @@ pub async fn run_heartbeat_loop(
                 if std::env::var("RIPOR_DEBUG_INGEST").ok().as_deref() == Some("1") {
                     debug!(payload=%body_str, url=%url, "heartbeat payload");
                 }
-                match client.post(url)
+                let mut sent = false;
+                match client.post(url.clone())
                     .header("Content-Type", "application/json")
-                    .header("Agent-Token", secrets.agent_token)
-                    .header("X-Body-HMAC", sig)
-                    .body(body_str)
+                    .header("Agent-Token", secrets.agent_token.clone())
+                    .header("X-Body-HMAC", sig.clone())
+                    .body(body_str.clone())
                     .send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        last_heartbeat_ts.store(now_ms(), Ordering::Relaxed);
+                    Ok(resp) if resp.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); sent = true; }
+                    Ok(resp) if resp.status().as_u16() == 401 => {
+                        if let Some(newsec) = rebootstrap(paths, &state).await {
+                            let sig2 = hmac_hex(&newsec.server_salt, body_str.as_bytes());
+                            match client.post(url)
+                                .header("Content-Type", "application/json")
+                                .header("Agent-Token", newsec.agent_token)
+                                .header("X-Body-HMAC", sig2)
+                                .body(body_str)
+                                .send().await {
+                                Ok(r2) if r2.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); sent = true; }
+                                Ok(r2) => warn!(status=?r2.status(), "heartbeat tras re-bootstrap falló"),
+                                Err(e2) => warn!(?e2, "heartbeat error red tras re-bootstrap"),
+                            }
+                        } else { warn!("re-bootstrap no disponible"); }
                     }
                     Ok(resp) => warn!(status=?resp.status(), "heartbeat falló"),
                     Err(e) => warn!(?e, "heartbeat error red"),
@@ -95,7 +109,7 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
             Ok(q) => q,
             Err(_) => continue,
         };
-        let batch = match q.fetch_batch(100) {
+        let batch = match q.fetch_batch_decrypted(100) {
             Ok(b) => b,
             Err(_) => vec![],
         };
@@ -108,8 +122,8 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
         let mac = get_primary_mac().unwrap_or_default();
         let os_name = std::env::consts::OS;
         let mut events_json: Vec<serde_json::Value> = Vec::new();
-        for (_id, blob) in &batch {
-            if let Ok(evt) = serde_json::from_slice::<serde_json::Value>(blob) {
+        for (_id, plain) in &batch {
+            if let Ok(evt) = serde_json::from_slice::<serde_json::Value>(plain) {
                 let app = evt.get("app_name").and_then(|v| v.as_str()).unwrap_or_default();
                 let title = evt.get("window_title").and_then(|v| v.as_str()).unwrap_or_default();
                 let ts = evt.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -143,11 +157,12 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
         if std::env::var("RIPOR_DEBUG_INGEST").ok().as_deref() == Some("1") {
             debug!(payload=%body_str, url=%url, count=%events_json.len(), "ingest payload");
         }
-        match client.post(url)
+        let mut ok_sent = false;
+        match client.post(url.clone())
             .header("Content-Type", "application/json")
-            .header("Agent-Token", secrets.agent_token)
-            .header("X-Body-HMAC", sig)
-            .body(body_str)
+            .header("Agent-Token", secrets.agent_token.clone())
+            .header("X-Body-HMAC", sig.clone())
+            .body(body_str.clone())
             .send().await {
             Ok(resp) if resp.status().is_success() => {
                 let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
@@ -155,6 +170,26 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
                     info!(count, "eventos enviados y eliminados de la cola");
                 }
                 backoff = 1;
+                ok_sent = true;
+            }
+            Ok(resp) if resp.status().as_u16() == 401 => {
+                if let Some(newsec) = rebootstrap(paths, &state).await {
+                    let sig2 = hmac_hex(&newsec.server_salt, body_str.as_bytes());
+                    match client.post(url)
+                        .header("Content-Type", "application/json")
+                        .header("Agent-Token", newsec.agent_token)
+                        .header("X-Body-HMAC", sig2)
+                        .body(body_str)
+                        .send().await {
+                        Ok(r2) if r2.status().is_success() => {
+                            let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
+                            if let Ok(count) = q.delete_ids(&ids) { info!(count, "eventos enviados tras re-bootstrap y eliminados"); }
+                            backoff = 1; ok_sent = true;
+                        }
+                        Ok(r2) => warn!(status=?r2.status(), "ingest tras re-bootstrap falló"),
+                        Err(e2) => warn!(?e2, "ingest error red tras re-bootstrap"),
+                    }
+                } else { warn!("re-bootstrap no disponible"); }
             }
             Ok(resp) => {
                 warn!(status=?resp.status(), "envío de eventos falló");
@@ -167,6 +202,7 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
                 backoff = (backoff * 2).min(60);
             }
         }
+        if ok_sent { continue; }
     }
 }
 
@@ -226,5 +262,39 @@ pub async fn bootstrap_if_needed(paths: &Paths, state: &AgentState) {
         }
         Ok(resp) => warn!(status=?resp.status(), "bootstrap falló"),
         Err(e) => warn!(?e, "bootstrap error red"),
+    }
+}
+
+async fn rebootstrap(paths: &Paths, state: &AgentState) -> Option<AgentSecrets> {
+    let base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => { info!("API_BASE_URL no configurado; no se puede re-bootstrap"); return None; } };
+    let org = match std::env::var("ORG_ID") { Ok(v) if !v.is_empty() => v, _ => { info!("ORG_ID no configurado; no se puede re-bootstrap"); return None; } };
+    let user = match std::env::var("USER_EMAIL") { Ok(v) if !v.is_empty() => v, _ => { info!("USER_EMAIL no configurado; no se puede re-bootstrap"); return None; } };
+    let mac = get_primary_mac().unwrap_or_default();
+    let body = serde_json::json!({
+        "org_id": org,
+        "user_email": user,
+        "mac_address": mac,
+        "agent_version": state.agent_version,
+    });
+    let url = format!("{}/v1/agents/bootstrap", base.trim_end_matches('/'));
+    let client = Client::builder().build().expect("client http");
+    match client.post(url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    let token = v.get("agentToken").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let salt = v.get("serverSalt").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let dev = v.get("deviceId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                    if !token.is_empty() && !salt.is_empty() {
+                        let secrets = AgentSecrets { agent_token: token, server_salt: salt, device_id: dev };
+                        if let Err(e) = secrets.save(paths) { warn!(?e, "no se pudo guardar secrets"); None }
+                        else { info!("re-bootstrap ok: token actualizado"); Some(secrets) }
+                    } else { warn!(?v, "re-bootstrap respuesta incompleta"); None }
+                }
+                Err(e) => { warn!(?e, "re-bootstrap parse fallo"); None }
+            }
+        }
+        Ok(resp) => { warn!(status=?resp.status(), "re-bootstrap falló"); None }
+        Err(e) => { warn!(?e, "re-bootstrap error red"); None }
     }
 }

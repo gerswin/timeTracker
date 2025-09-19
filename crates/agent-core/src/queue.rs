@@ -60,6 +60,20 @@ impl Queue {
         Ok(out)
     }
 
+    pub fn fetch_batch_decrypted(&self, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, payload FROM events ORDER BY created_at ASC LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, blob) = r?;
+            let plain = crate::crypto::decrypt_decompress(&self.key, &self.aad, &blob)?;
+            out.push((id, plain));
+        }
+        Ok(out)
+    }
+
     pub fn delete_ids(&self, ids: &[i64]) -> Result<usize> {
         if ids.is_empty() { return Ok(0); }
         let mut count = 0usize;
