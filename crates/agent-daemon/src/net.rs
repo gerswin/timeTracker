@@ -128,28 +128,56 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
             if let Ok(evt) = serde_json::from_slice::<serde_json::Value>(plain) {
                 let app = evt.get("app_name").and_then(|v| v.as_str()).unwrap_or_default();
                 let title = evt.get("window_title").and_then(|v| v.as_str()).unwrap_or_default();
-                let ts = evt.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                let idle = evt.get("input_idle_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                let state_s = if idle < idle_threshold_ms() { "active" } else { "idle" };
-                events_json.push(serde_json::json!({
-                    "org_id": std::env::var("ORG_ID").ok().unwrap_or_default(),
-                    "user_email": std::env::var("USER_EMAIL").ok().unwrap_or_default(),
-                    "device_id": secrets.device_id.as_deref().unwrap_or(&state.device_id),
-                    "mac_address": mac,
-                    "os": os_name,
-                    "app_name": app,
-                    "window_title": title,
-                    "state": state_s,
-                    "timestamp_ms": ts,
-                    "dur_ms": 0,
-                    "category": "",
-                    "focus": true,
-                    "focus_start_ms": ts,
-                    "focus_end_ms": ts,
-                    "input_idle_ms": idle,
-                    "media_hint": "",
-                    "agent_version": state.agent_version,
-                }));
+                let org = std::env::var("ORG_ID").ok().unwrap_or_default();
+                let user = std::env::var("USER_EMAIL").ok().unwrap_or_default();
+                if evt.get("type").and_then(|v| v.as_str()) == Some("focus_block") {
+                    let fs = evt.get("focus_start_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let fe = evt.get("focus_end_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let dur = evt.get("dur_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ts = fe.max(fs);
+                    events_json.push(serde_json::json!({
+                        "org_id": org,
+                        "user_email": user,
+                        "device_id": secrets.device_id.as_deref().unwrap_or(&state.device_id),
+                        "mac_address": mac,
+                        "os": os_name,
+                        "app_name": app,
+                        "window_title": title,
+                        "state": "active",
+                        "timestamp_ms": ts,
+                        "dur_ms": dur,
+                        "category": "",
+                        "focus": true,
+                        "focus_start_ms": fs,
+                        "focus_end_ms": fe,
+                        "input_idle_ms": 0,
+                        "media_hint": "",
+                        "agent_version": state.agent_version,
+                    }));
+                } else {
+                    let ts = evt.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let idle = evt.get("input_idle_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let state_s = if idle < idle_threshold_ms() { "active" } else { "idle" };
+                    events_json.push(serde_json::json!({
+                        "org_id": org,
+                        "user_email": user,
+                        "device_id": secrets.device_id.as_deref().unwrap_or(&state.device_id),
+                        "mac_address": mac,
+                        "os": os_name,
+                        "app_name": app,
+                        "window_title": title,
+                        "state": state_s,
+                        "timestamp_ms": ts,
+                        "dur_ms": 0,
+                        "category": "",
+                        "focus": true,
+                        "focus_start_ms": ts,
+                        "focus_end_ms": ts,
+                        "input_idle_ms": idle,
+                        "media_hint": "",
+                        "agent_version": state.agent_version,
+                    }));
+                }
             }
         }
         let body = serde_json::json!({ "events": events_json });

@@ -19,6 +19,65 @@ struct CaptureEvent {
     input_idle_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FocusBlockDto {
+    pub app_name: String,
+    pub window_title: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub dur_ms: u64,
+}
+
+#[derive(Default)]
+pub struct FocusAgg {
+    inner: std::sync::Mutex<FocusState>,
+}
+
+#[derive(Default)]
+struct FocusState {
+    current_app: String,
+    current_title: String,
+    block_start: u64,
+    last_ts: u64,
+    recent: std::collections::VecDeque<FocusBlockDto>,
+}
+
+impl FocusAgg {
+    pub fn new() -> std::sync::Arc<Self> { std::sync::Arc::new(Self { inner: std::sync::Mutex::new(FocusState { recent: std::collections::VecDeque::with_capacity(100), ..Default::default() }) }) }
+    pub fn on_event(&self, ts: u64, app: &str, title: &str) -> Option<FocusBlockDto> {
+        let mut st = self.inner.lock().unwrap();
+        if st.current_app != app || st.current_title != title {
+            // finalize previous block
+            if st.block_start != 0 && st.last_ts >= st.block_start {
+                let b = FocusBlockDto { app_name: st.current_app.clone(), window_title: st.current_title.clone(), start_ms: st.block_start, end_ms: st.last_ts, dur_ms: st.last_ts.saturating_sub(st.block_start) };
+                st.recent.push_back(b);
+                if st.recent.len() > 100 { st.recent.pop_front(); }
+                // prepare return
+                let ret = st.recent.back().cloned();
+                // switch current
+                st.current_app = app.to_string();
+                st.current_title = title.to_string();
+                st.block_start = ts;
+                st.last_ts = ts;
+                return ret;
+            }
+            st.current_app = app.to_string();
+            st.current_title = title.to_string();
+            st.block_start = ts;
+        }
+        st.last_ts = ts;
+        None
+    }
+    pub fn recent(&self, limit: usize, min_minutes: u32) -> Vec<FocusBlockDto> {
+        let st = self.inner.lock().unwrap();
+        let mut v: Vec<FocusBlockDto> = st.recent.iter().rev().cloned().collect();
+        let min_ms = (min_minutes as u64).saturating_mul(60_000);
+        v.retain(|b| b.dur_ms >= min_ms);
+        if v.len() > limit { v.truncate(limit); }
+        v
+    }
+}
+
 pub async fn run_capture_loop(
     state: Arc<AgentState>,
     paths: &agent_core::paths::Paths,
@@ -29,6 +88,7 @@ pub async fn run_capture_loop(
     dropped_counter: Arc<AtomicU64>,
     drop_counters: Arc<crate::policy::DropCounters>,
     drop_log: Arc<crate::policy::DropLog>,
+    focus_agg: std::sync::Arc<FocusAgg>,
 ) {
     info!("iniciando loop de captura (Fase 1)");
     println!("[debug] capture loop started");
@@ -83,6 +143,24 @@ pub async fn run_capture_loop(
                         window_title: effective_title.clone(),
                         input_idle_ms: idle_ms,
                     };
+                    if let Some(block) = focus_agg.on_event(evt.ts_ms, &evt.app_name, &evt.window_title) {
+                        // Si cumple el umbral de focus, encolar evento de bloque para el sender
+                        let min_m = policy_rt.get().policy.focusMinMinutes.unwrap_or(5) as u64;
+                        if block.dur_ms >= min_m.saturating_mul(60_000) {
+                            if let Ok(q) = Queue::open(paths, &state) {
+                                let fb = serde_json::json!({
+                                    "type": "focus_block",
+                                    "app_name": block.app_name,
+                                    "window_title": block.window_title,
+                                    "focus_start_ms": block.start_ms,
+                                    "focus_end_ms": block.end_ms,
+                                    "dur_ms": block.dur_ms,
+                                    "ts_ms": block.end_ms,
+                                });
+                                let _ = q.enqueue_json(serde_json::to_string(&fb).unwrap().as_bytes());
+                            }
+                        }
+                    }
                     debug!("abriendo queue para enqueue");
                     if let Ok(q) = Queue::open(paths, &state) {
                         if let Ok(_) = q.enqueue_json(&serde_json::to_vec(&evt).unwrap()) {

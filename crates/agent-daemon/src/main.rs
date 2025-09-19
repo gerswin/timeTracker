@@ -50,6 +50,7 @@ struct AppCtx {
     dropped_events: Arc<AtomicU64>,
     drop_counters: std::sync::Arc<policy::DropCounters>,
     drop_log: std::sync::Arc<policy::DropLog>,
+    focus_agg: std::sync::Arc<capture::FocusAgg>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +78,7 @@ struct StateDto {
     policy_etag: Option<String>,
     dropped_events: u64,
     dropped_by_reason: serde_json::Value,
+    focus_blocks: Vec<capture::FocusBlockDto>,
 }
 
 // Usamos runtime de un solo hilo para garantizar que las llamadas a AppKit/AX
@@ -111,6 +113,7 @@ async fn main() -> Result<()> {
         dropped_events: Arc::new(AtomicU64::new(0)),
         drop_counters: std::sync::Arc::new(policy::DropCounters::default()),
         drop_log: policy::DropLog::new(200),
+        focus_agg: capture::FocusAgg::new(),
     };
 
     let app_ctx = ctx.clone();
@@ -224,7 +227,8 @@ async fn main() -> Result<()> {
     let dropped1 = ctx.dropped_events.clone();
     let dropc1 = ctx.drop_counters.clone();
     let droplog1 = ctx.drop_log.clone();
-    tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1, dropc1, droplog1).await; });
+    let focus1 = ctx.focus_agg.clone();
+    tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1, dropc1, droplog1, focus1).await; });
     let bg_state2 = ctx.state.clone();
     let bg_paths2 = ctx.paths.clone();
     let bg_metrics2 = ctx.metrics.clone();
@@ -556,6 +560,7 @@ async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
             "excludedPattern": dc.excluded_pattern.load(Ordering::Relaxed),
             "throttled": dc.throttled.load(Ordering::Relaxed),
         }),
+        focus_blocks: ctx.focus_agg.recent(5, ctx.policy_rt.get().policy.focusMinMinutes.unwrap_or(5)),
     })
 }
 

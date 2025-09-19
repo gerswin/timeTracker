@@ -31,6 +31,8 @@ async function refreshAll(){
     $('policy').textContent = json(st.policy || {});
     const dbr = document.getElementById('dropped_by_reason');
     if(dbr){ dbr.textContent = json(st.dropped_by_reason || {}); }
+    const fb = document.getElementById('focus_blocks');
+    if(fb){ fb.textContent = json(st.focus_blocks || []); }
     const permsSection = $('perms-section');
     if(permsSection){
       if(st.perms && st.perms.unsupported){
@@ -87,4 +89,3 @@ document.addEventListener('DOMContentLoaded', ()=>{
   refreshAll();
   setInterval(refreshAll, 2000);
 });
-
