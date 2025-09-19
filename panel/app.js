@@ -26,6 +26,9 @@ async function refreshAll(){
     $('last_event_ts').textContent = fmtTs(st.last_event_ts);
     $('last_heartbeat_ts').textContent = fmtTs(st.last_heartbeat_ts);
     $('queue').textContent = json(st.queue_preview);
+    $('policy_etag').textContent = st.policy_etag || '';
+    $('dropped').textContent = String(st.dropped_events || 0);
+    $('policy').textContent = json(st.policy || {});
     const permsSection = $('perms-section');
     if(permsSection){
       if(st.perms && st.perms.unsupported){
@@ -82,6 +85,5 @@ document.addEventListener('DOMContentLoaded', ()=>{
   refreshAll();
   setInterval(refreshAll, 2000);
 });
-
 
 

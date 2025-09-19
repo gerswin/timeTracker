@@ -306,6 +306,8 @@ async fn ui_index() -> Html<&'static str> {
       <div class="card"><div class="muted">Actividad</div><div id="act"></div></div>
       <div class="card"><div class="muted">Monitoreo</div><div id="mon"></div></div>
       <div class="card"><div class="muted">Cola</div><div id="qlen"></div></div>
+      <div class="card"><div class="muted">Descartes</div><div id="dropped"></div></div>
+      <div class="card"><div class="muted">Policy ETag</div><div id="petag"></div></div>
     </div>
     <div class="card" id="perms-card" style="margin:0 16px"><div class="muted">Permisos</div><div id="perms">—</div>
       <div class="muted" style="margin-top:6px">Binario a autorizar:</div>
@@ -318,6 +320,7 @@ async fn ui_index() -> Html<&'static str> {
     </div>
     <div class="card" style="margin:12px 16px"><div class="muted">Foco</div><div id="focus_consistency">—</div><pre id="focus">—</pre></div>
     <pre id="queue">—</pre>
+    <div class="card" style="margin:12px 16px"><div class="muted">Política efectiva</div><pre id="policy">—</pre></div>
     <script>
       async function j(u){const r=await fetch(u,{cache:'no-store'});if(!r.ok)throw new Error(u+':'+r.status);return r.json()}
       async function ref(){
@@ -329,6 +332,8 @@ async fn ui_index() -> Html<&'static str> {
           document.getElementById('idle').textContent=s.input_idle_ms;
           document.getElementById('act').textContent=s.activity_state;
           document.getElementById('qlen').textContent=s.queue_len;
+          document.getElementById('dropped').textContent=String(s.dropped_events||0);
+          document.getElementById('petag').textContent=s.policy_etag||'';
                     const permsCard = document.getElementById('perms-card');
           if(permsCard){
             if(s.perms && s.perms.unsupported){
@@ -377,6 +382,72 @@ async fn ui_index() -> Html<&'static str> {
               focusEl.textContent=JSON.stringify(details,null,2);
               consistencyEl.className='muted';
               consistencyEl.textContent=f.title_source ? 'Fuente: '+f.title_source : '';
+            } else {
+              const details={
+                app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
+                window_title:Object.prototype.hasOwnProperty.call(f,'window_title')?f.window_title:null,
+                title_source:Object.prototype.hasOwnProperty.call(f,'title_source')?f.title_source:null,
+                input_idle_ms:Object.prototype.hasOwnProperty.call(f,'input_idle_ms')?f.input_idle_ms:null,
+                ax_name:f.ax_name ?? null,
+                ns_name:f.ns_name ?? null,
+                cg_owner:f.cg_owner ?? null,
+                cg_title:f.cg_title ?? null,
+                ax_title:f.ax_title ?? null,
+              };
+              focusEl.textContent=JSON.stringify(details,null,2);
+              const names=[f.ax_name,f.ns_name,f.cg_owner].filter(Boolean);
+              if(names.length>0 && names.every(n=>n===names[0])){
+                consistencyEl.className='ok';
+                consistencyEl.textContent='OK: AX/NS/CG concuerdan ('+names[0]+')';
+              } else if(names.length>0){
+                consistencyEl.className='warn';
+                consistencyEl.textContent='ATENCION: fuentes difieren - AX='+(f.ax_name||'N/A')+' / NS='+(f.ns_name||'N/A')+' / CG='+(f.cg_owner||'N/A');
+              } else {
+                consistencyEl.className='muted';
+                consistencyEl.textContent='Foco disponible (sin AX/NS/CG)';
+              }
+            }
+          }
+        }catch(e){ console.error('sample', e); }
+      }
+      document.addEventListener('DOMContentLoaded',()=>{
+        const btn=document.getElementById('prompt');
+        if(btn){ btn.onclick=()=>j('/permissions/prompt').then(()=>setTimeout(ref,1500)); }
+        const bax=document.getElementById('openAx'); if(bax){ bax.onclick=()=>j('/permissions/open/accessibility').then(()=>setTimeout(ref,1000)); }
+        const bsc=document.getElementById('openSc'); if(bsc){ bsc.onclick=()=>j('/permissions/open/screen').then(()=>setTimeout(ref,1000)); }
+        ref(); setInterval(ref,2000);
+      });
+              try{document.getElementById('policy').textContent = JSON.stringify(s.policy||{},null,2);}catch(e){}
+        }catch(e){ console.error('state', e); }
+        try{const q=await j('/queue?limit=10'); document.getElementById('queue').textContent=JSON.stringify(q.top,null,2);}catch(e){ console.error('queue', e); }
+        try{const f=await j('/debug/sample');
+          const focusEl=document.getElementById('focus');
+          const consistencyEl=document.getElementById('focus_consistency');
+          if(f && f.unsupported){
+            focusEl.textContent='No disponible en este sistema';
+            consistencyEl.className='muted';
+            consistencyEl.textContent='';
+          } else if(f && f.error){
+            focusEl.textContent='Error: '+f.error;
+            consistencyEl.className='warn';
+            consistencyEl.textContent='Error al obtener foco';
+          } else {
+            if(Object.prototype.hasOwnProperty.call(f,'win_pid')){
+              const details={
+                app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
+                window_title:Object.prototype.hasOwnProperty.call(f,'window_title')?f.window_title:null,
+                title_source:Object.prototype.hasOwnProperty.call(f,'title_source')?f.title_source:null,
+                input_idle_ms:Object.prototype.hasOwnProperty.call(f,'input_idle_ms')?f.input_idle_ms:null,
+                win_pid:f.win_pid != null ? f.win_pid : null,
+                win_thread_id:f.win_thread_id != null ? f.win_thread_id : null,
+                win_hwnd:f.win_hwnd != null ? f.win_hwnd : null,
+                win_root_hwnd:f.win_root_hwnd != null ? f.win_root_hwnd : null,
+                win_class:f.win_class != null ? f.win_class : null,
+                win_process_path:f.win_process_path != null ? f.win_process_path : null,
+              };
+              focusEl.textContent=JSON.stringify(details,null,2);
+              consistencyEl.className='muted';
+              consistencyEl.textContent=f.title_source ? "Fuente: "+f.title_source : "";
             } else {
               const details={
                 app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
