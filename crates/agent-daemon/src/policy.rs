@@ -17,6 +17,8 @@ pub struct Policy {
     #[serde(default)]
     pub excludePatterns: Vec<String>,
     #[serde(default)]
+    pub excludeExePaths: Vec<String>,
+    #[serde(default)]
     pub updateChannel: Option<String>,
     #[serde(default)]
     pub titleSampleHz: Option<u32>,

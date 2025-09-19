@@ -134,7 +134,8 @@ async fn main() -> Result<()> {
         .route("/debug/windows", get(debug_windows_handler))
         .route("/debug/window", get(debug_windows_handler))
         .route("/debug/frontmost", get(debug_frontmost_handler))
-        .route("/policy/apply", post(policy_apply_handler));
+        .route("/policy/apply", post(policy_apply_handler))
+        .route("/policy/refresh", post(policy_refresh_handler));
     // Resolver carpeta de panel estático: PANEL_DIR, ./panel, o ../../panel (raíz del workspace)
     let static_dir = std::env::var("PANEL_DIR")
         .ok()
@@ -329,7 +330,11 @@ async fn ui_index() -> Html<&'static str> {
     </div>
     <div class="card" style="margin:12px 16px"><div class="muted">Foco</div><div id="focus_consistency">—</div><pre id="focus">—</pre></div>
     <pre id="queue">—</pre>
-    <div class="card" style="margin:12px 16px"><div class="muted">Política efectiva</div><pre id="policy">—</pre></div>
+    <div class="card" style="margin:12px 16px">
+      <div class="muted">Política efectiva</div>
+      <div style="margin:6px 0"><button id="btn-refresh-policy">Refrescar política</button></div>
+      <pre id="policy">—</pre>
+    </div>
     <script>
       async function j(u){const r=await fetch(u,{cache:'no-store'});if(!r.ok)throw new Error(u+':'+r.status);return r.json()}
       async function ref(){
@@ -424,6 +429,7 @@ async fn ui_index() -> Html<&'static str> {
         if(btn){ btn.onclick=()=>j('/permissions/prompt').then(()=>setTimeout(ref,1500)); }
         const bax=document.getElementById('openAx'); if(bax){ bax.onclick=()=>j('/permissions/open/accessibility').then(()=>setTimeout(ref,1000)); }
         const bsc=document.getElementById('openSc'); if(bsc){ bsc.onclick=()=>j('/permissions/open/screen').then(()=>setTimeout(ref,1000)); }
+        const brp=document.getElementById('btn-refresh-policy'); if(brp){ brp.onclick=()=>fetch('/policy/refresh',{method:'POST'}).then(()=>setTimeout(ref,1000)); }
         ref(); setInterval(ref,2000);
       });
               try{document.getElementById('policy').textContent = JSON.stringify(s.policy||{},null,2);}catch(e){}
@@ -576,6 +582,13 @@ async fn policy_apply_handler(AxumState(ctx): AxumState<AppCtx>, axum::Json(body
         }
         Err(e) => Json(serde_json::json!({"ok": false, "error": format!("parse failed: {}", e)})),
     }
+}
+
+async fn policy_refresh_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<serde_json::Value> {
+    let p = ctx.paths.clone();
+    let rt = ctx.policy_rt.clone();
+    tokio::spawn(async move { crate::net::fetch_policy_once(&p, rt).await; });
+    Json(serde_json::json!({"ok": true}))
 }
 
 #[derive(Deserialize)]

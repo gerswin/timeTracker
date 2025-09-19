@@ -69,7 +69,7 @@ pub async fn run_capture_loop(
                 let changed = app != prev_app || effective_title != prev_title;
                 let force_emit = should_force_emit(last_event_ts.load(Ordering::Relaxed));
                 if changed || force_emit {
-                    if !thr.permit(now) {
+                    if !thr.permit(now, force_emit) {
                         dropped_counter.fetch_add(1, Ordering::Relaxed);
                         drop_counters.throttled.fetch_add(1, Ordering::Relaxed);
                         drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: "throttled".into(), app: app.clone(), title: effective_title.clone() });
@@ -129,7 +129,49 @@ fn drop_reason(pol: &PolicyState, app: &str, title: &str) -> Option<DropReason> 
         }
         if let Ok(gs) = b.build() { if gs.is_match(title) { return Some(DropReason::ExcludedPattern); } }
     }
+    if !p.excludeExePaths.is_empty() {
+        if let Some(exe) = front_exe_identity() {
+            let mut b = GlobSetBuilder::new();
+            for pat in &p.excludeExePaths { if let Ok(g) = Glob::new(pat) { b.add(g); } }
+            if let Ok(gs) = b.build() { if gs.is_match(&exe) { return Some(DropReason::ExcludedPattern); } }
+        }
+    }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn front_exe_identity() -> Option<String> {
+    if let Some((pid, _name)) = ax_focused_app() { return ns_running_app_bundle_id(pid); }
+    unsafe {
+        use objc::runtime::Object; use objc::{class, msg_send, sel, sel_impl};
+        let ws: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if ws.is_null() { return None; }
+        let app: *mut Object = msg_send![ws, frontmostApplication];
+        if app.is_null() { return None; }
+        let pid: i32 = msg_send![app, processIdentifier];
+        ns_running_app_bundle_id(pid)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn front_exe_identity() -> Option<String> {
+    capture_foreground().ok().map(|s| s.process_path)
+}
+
+#[cfg(target_os = "linux")]
+fn front_exe_identity() -> Option<String> { None }
+
+#[cfg(target_os = "macos")]
+fn ns_running_app_bundle_id(pid: i32) -> Option<String> {
+    use objc::{class, msg_send, sel, sel_impl};
+    use objc::runtime::Object;
+    unsafe {
+        let nsapp: *mut Object = msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if nsapp.is_null() { return None; }
+        let bid: *mut Object = msg_send![nsapp, bundleIdentifier];
+        if bid.is_null() { return None; }
+        Some(nsstring_to_string(bid))
+    }
 }
 
 struct Throttle {
@@ -142,10 +184,7 @@ struct Throttle {
 }
 
 impl Throttle {
-    fn new() -> Self {
-        let mut t = Self { capacity: 10.0, tokens: 10.0, rate_per_sec: 10.0/60.0, last_refill_ms: now_ms(), min_interval_ms: 500, last_emit_ms: 0 };
-        t
-    }
+    fn new() -> Self { Self { capacity: 10.0, tokens: 10.0, rate_per_sec: 10.0/60.0, last_refill_ms: now_ms(), min_interval_ms: 500, last_emit_ms: 0 } }
     fn update_from_policy(&mut self, pol: &crate::policy::Policy) {
         if let Some(bpm) = pol.titleBurstPerMinute { let cap = bpm.max(1) as f64; self.capacity = cap; self.rate_per_sec = cap/60.0; if self.tokens > self.capacity { self.tokens = self.capacity; } }
         if let Some(hz) = pol.titleSampleHz { let hz = hz.max(1) as u64; self.min_interval_ms = (1000 / hz).max(100); }
@@ -157,9 +196,11 @@ impl Throttle {
         self.tokens = (self.tokens + add).min(self.capacity);
         self.last_refill_ms = now;
     }
-    fn permit(&mut self, now: u64) -> bool {
+    fn permit(&mut self, now: u64, force: bool) -> bool {
         self.refill(now);
-        if self.last_emit_ms != 0 && now.saturating_sub(self.last_emit_ms) < self.min_interval_ms { return false; }
+        if !force {
+            if self.last_emit_ms != 0 && now.saturating_sub(self.last_emit_ms) < self.min_interval_ms { return false; }
+        }
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             self.last_emit_ms = now;

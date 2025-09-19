@@ -41,6 +41,10 @@ enum PolicySub {
         /// Ruta del archivo JSON con la policy (puede incluir {"policy":{...}} o la policy directa)
         file: String,
     },
+    /// Edita el policy.json local con $EDITOR (o abre con app por defecto) y aplica
+    Edit,
+    /// Solicita al agente que refresque la policy desde el backend (ETag-aware)
+    Refresh,
 }
 
 fn main() -> Result<()> {
@@ -51,6 +55,8 @@ fn main() -> Result<()> {
             PolicySub::Pull => policy_pull(),
             PolicySub::Open { inline } => policy_open(inline),
             PolicySub::Apply { file } => policy_apply(&file),
+            PolicySub::Edit => policy_edit(),
+            PolicySub::Refresh => policy_refresh(),
         },
     }
 }
@@ -91,7 +97,11 @@ fn policy_pull() -> Result<()> {
         let meta = serde_json::json!({"etag": etag});
         std::fs::write(paths.policy_meta_file(), serde_json::to_vec_pretty(&meta)?)?;
         println!("[ok] Policy guardada en {} (etag={:?})", paths.policy_file().display(), meta.get("etag"));
-        Ok(())
+        // Hot-apply en el agente local
+        let panel = panel_base();
+        let apply = Client::new().post(format!("{}/policy/apply", panel)).json(&pol_v).send()?;
+        if apply.status().is_success() { println!("[ok] Policy aplicada en agente local"); Ok(()) }
+        else { println!("[warn] No se pudo aplicar en agente: {}", apply.status()); Ok(()) }
     } else if resp.status().as_u16() == 304 {
         println!("[ok] Policy sin cambios (304)");
         Ok(())
@@ -121,4 +131,23 @@ fn policy_apply(file: &str) -> Result<()> {
     let resp = Client::new().post(url).json(&v).send()?;
     if resp.status().is_success() { println!("[ok] policy aplicada y guardada"); Ok(()) }
     else { Err(anyhow!("falló aplicar en agente: {}", resp.status())) }
+}
+
+fn policy_edit() -> Result<()> {
+    let paths = agent_core::paths::Paths::new()?;
+    let f = paths.policy_file();
+    if !f.exists() { std::fs::write(&f, b"{}")?; }
+    if let Ok(editor) = std::env::var("EDITOR") {
+        std::process::Command::new(editor).arg(&f).status()?;
+    } else {
+        webbrowser::open(f.to_str().unwrap_or("")).ok();
+    }
+    policy_apply(f.to_str().unwrap_or(""))
+}
+
+fn policy_refresh() -> Result<()> {
+    let base = panel_base();
+    let url = format!("{}/policy/refresh", base);
+    let resp = Client::new().post(url).send()?;
+    if resp.status().is_success() { println!("[ok] refresh solicitado"); Ok(()) } else { Err(anyhow!("falló refresh: {}", resp.status())) }
 }

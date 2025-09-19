@@ -80,6 +80,7 @@ pub async fn run_heartbeat_loop(
                             }
                         } else { warn!("re-bootstrap no disponible"); }
                     }
+                    Ok(resp) if resp.status().as_u16() == 403 => { warn!(status=?resp.status(), "heartbeat forbidden (403)"); }
                     Ok(resp) => warn!(status=?resp.status(), "heartbeat falló"),
                     Err(e) => warn!(?e, "heartbeat error red"),
                 }
@@ -191,6 +192,10 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
                         Err(e2) => warn!(?e2, "ingest error red tras re-bootstrap"),
                     }
                 } else { warn!("re-bootstrap no disponible"); }
+            }
+            Ok(resp) if resp.status().as_u16() == 403 => {
+                warn!(status=?resp.status(), "ingest forbidden (403)");
+                sleep(Duration::from_secs(backoff)).await; backoff = (backoff*2).min(60);
             }
             Ok(resp) => {
                 warn!(status=?resp.status(), "envío de eventos falló");
@@ -348,5 +353,30 @@ pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
             Err(e) => warn!(?e, "policy error red"),
         }
         sleep(Duration::from_secs(300)).await;
+    }
+}
+
+
+pub async fn fetch_policy_once(paths: &Paths, rt: std::sync::Arc<PolicyRuntime>) {
+    let client = Client::builder().build().expect("client http");
+    let base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => return };
+    let user = match std::env::var("USER_EMAIL") { Ok(v) if !v.is_empty() => v, _ => return };
+    let secrets = match AgentSecrets::load(paths).ok().flatten() { Some(s) => s, None => return };
+    let url = format!("{}/v1/policy/{}", base.trim_end_matches('/'), urlencoding::encode(&user));
+    let etag = rt.get().etag;
+    let mut req = client.get(url).header("Agent-Token", secrets.agent_token);
+    if let Some(tag) = etag.as_deref() { req = req.header("If-None-Match", tag); }
+    if let Ok(resp) = req.send().await {
+        if resp.status().is_success() {
+            let hdr = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                let polv = v.get("policy").cloned().unwrap_or(v);
+                if let Ok(policy) = serde_json::from_value::<crate::policy::Policy>(polv) {
+                    let st = PolicyState { policy, etag: hdr };
+                    let _ = save_policy(paths, &st);
+                    rt.set(st);
+                }
+            }
+        }
     }
 }

@@ -86,6 +86,9 @@ Tareas
 - [x] `killSwitch` y `pauseCapture` respetados (heartbeats siguen activos)
 - [ ] CLI: `agent policy show|pull`
 - [x] Panel/UI: mostrar política efectiva (ETag + JSON) y contadores de descartes
+- [x] Endpoint `/policy/refresh` y botón/CLI para refrescar policy en caliente
+- [x] `excludeExePaths[]` aplicado (macOS bundleId, Windows ruta de ejecutable)
+- [x] Ajuste throttling: forced emit respeta token bucket (salta solo debounce)
 
 DoD
 - [ ] Títulos sensibles nunca persisten ni salen del proceso
