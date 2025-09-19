@@ -28,6 +28,7 @@ pub async fn run_capture_loop(
     policy_rt: std::sync::Arc<PolicyRuntime>,
     dropped_counter: Arc<AtomicU64>,
     drop_counters: Arc<crate::policy::DropCounters>,
+    drop_log: Arc<crate::policy::DropLog>,
 ) {
     info!("iniciando loop de captura (Fase 1)");
     println!("[debug] capture loop started");
@@ -59,6 +60,7 @@ pub async fn run_capture_loop(
                         DropReason::ExcludedPattern => drop_counters.excluded_pattern.fetch_add(1, Ordering::Relaxed),
                         DropReason::Throttled => drop_counters.throttled.fetch_add(1, Ordering::Relaxed),
                     };
+                    drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: match reason { DropReason::KillSwitch=>"killSwitch", DropReason::PauseCapture=>"pauseCapture", DropReason::ExcludedApp=>"excludedApp", DropReason::ExcludedPattern=>"excludedPattern", DropReason::Throttled=>"throttled" }.to_string(), app: app.clone(), title: title.clone() });
                     sleep(Duration::from_millis(1000)).await;
                     continue;
                 }
@@ -70,6 +72,7 @@ pub async fn run_capture_loop(
                     if !thr.permit(now) {
                         dropped_counter.fetch_add(1, Ordering::Relaxed);
                         drop_counters.throttled.fetch_add(1, Ordering::Relaxed);
+                        drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: "throttled".into(), app: app.clone(), title: effective_title.clone() });
                         // Throttled: no emit this tick
                         sleep(Duration::from_millis(1000)).await;
                         continue;

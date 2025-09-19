@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
+use std::collections::VecDeque;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Policy {
@@ -70,4 +72,30 @@ pub struct DropCounters {
     pub excluded_app: std::sync::atomic::AtomicU64,
     pub excluded_pattern: std::sync::atomic::AtomicU64,
     pub throttled: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DropEvent {
+    pub ts_ms: u64,
+    pub reason: String,
+    pub app: String,
+    pub title: String,
+}
+
+#[derive(Debug)]
+pub struct DropLog { inner: Mutex<VecDeque<DropEvent>>, cap: usize }
+
+impl DropLog {
+    pub fn new(cap: usize) -> Arc<Self> { Arc::new(Self { inner: Mutex::new(VecDeque::with_capacity(cap.min(10_000))), cap: cap.max(1) }) }
+    pub fn push(&self, ev: DropEvent) {
+        let mut q = self.inner.lock().unwrap();
+        if q.len() >= self.cap { q.pop_front(); }
+        q.push_back(ev);
+    }
+    pub fn list_desc(&self, limit: usize) -> Vec<DropEvent> {
+        let q = self.inner.lock().unwrap();
+        let n = q.len();
+        let take = limit.min(n);
+        q.iter().rev().take(take).cloned().collect()
+    }
 }

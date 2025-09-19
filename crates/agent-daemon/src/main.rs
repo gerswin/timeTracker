@@ -49,6 +49,7 @@ struct AppCtx {
     policy_rt: std::sync::Arc<policy::PolicyRuntime>,
     dropped_events: Arc<AtomicU64>,
     drop_counters: std::sync::Arc<policy::DropCounters>,
+    drop_log: std::sync::Arc<policy::DropLog>,
 }
 
 #[derive(Serialize)]
@@ -109,6 +110,7 @@ async fn main() -> Result<()> {
         policy_rt: policy::PolicyRuntime::new(),
         dropped_events: Arc::new(AtomicU64::new(0)),
         drop_counters: std::sync::Arc::new(policy::DropCounters::default()),
+        drop_log: policy::DropLog::new(200),
     };
 
     let app_ctx = ctx.clone();
@@ -118,6 +120,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/state", get(state_handler))
         .route("/queue", get(queue_handler))
+        .route("/debug/drops", get(debug_drops_handler))
         .route("/pause", get(pause_handler))
         .route("/pause/clear", get(pause_clear_handler))
         .route("/permissions", get(perms_handler))
@@ -218,7 +221,8 @@ async fn main() -> Result<()> {
     let pol1 = ctx.policy_rt.clone();
     let dropped1 = ctx.dropped_events.clone();
     let dropc1 = ctx.drop_counters.clone();
-    tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1, dropc1).await; });
+    let droplog1 = ctx.drop_log.clone();
+    tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1, dropc1, droplog1).await; });
     let bg_state2 = ctx.state.clone();
     let bg_paths2 = ctx.paths.clone();
     let bg_metrics2 = ctx.metrics.clone();
@@ -546,6 +550,15 @@ async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
             "throttled": dc.throttled.load(Ordering::Relaxed),
         }),
     })
+}
+
+#[derive(Deserialize)]
+struct DropsParams { limit: Option<usize> }
+
+async fn debug_drops_handler(AxumState(ctx): AxumState<AppCtx>, Query(p): Query<DropsParams>) -> Json<serde_json::Value> {
+    let limit = p.limit.unwrap_or(50).min(500);
+    let items = ctx.drop_log.list_desc(limit);
+    Json(serde_json::json!({ "total": items.len(), "items": items }))
 }
 
 #[derive(Deserialize)]
