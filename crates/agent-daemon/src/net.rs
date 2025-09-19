@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -53,6 +53,9 @@ pub async fn run_heartbeat_loop(
                 let body_str = serde_json::to_string(&body).unwrap();
                 let sig = hmac_hex(&secrets.server_salt, body_str.as_bytes());
                 let url = format!("{}/v1/agents/heartbeat", base.trim_end_matches('/'));
+                if std::env::var("RIPOR_DEBUG_INGEST").ok().as_deref() == Some("1") {
+                    debug!(payload=%body_str, url=%url, "heartbeat payload");
+                }
                 match client.post(url)
                     .header("Content-Type", "application/json")
                     .header("Agent-Token", secrets.agent_token)
@@ -137,6 +140,9 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
         let body_str = serde_json::to_string(&body).unwrap();
         let sig = hmac_hex(&secrets.server_salt, body_str.as_bytes());
         let url = format!("{}/v1/events:ingest", api_base.trim_end_matches('/'));
+        if std::env::var("RIPOR_DEBUG_INGEST").ok().as_deref() == Some("1") {
+            debug!(payload=%body_str, url=%url, count=%events_json.len(), "ingest payload");
+        }
         match client.post(url)
             .header("Content-Type", "application/json")
             .header("Agent-Token", secrets.agent_token)
