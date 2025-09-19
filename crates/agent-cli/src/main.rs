@@ -30,6 +30,17 @@ enum PolicySub {
     },
     /// Descarga la política desde el backend y la guarda localmente
     Pull,
+    /// Abre el panel del agente en el navegador
+    Open {
+        /// Usa la UI inline (/) en vez del panel estático (/panel)
+        #[arg(long)]
+        inline: bool,
+    },
+    /// Aplica una policy local inmediatamente (escribe disco y notifica al agente)
+    Apply {
+        /// Ruta del archivo JSON con la policy (puede incluir {"policy":{...}} o la policy directa)
+        file: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -38,6 +49,8 @@ fn main() -> Result<()> {
         Cmd::Policy(pc) => match pc.sub {
             PolicySub::Show { json } => policy_show(json),
             PolicySub::Pull => policy_pull(),
+            PolicySub::Open { inline } => policy_open(inline),
+            PolicySub::Apply { file } => policy_apply(&file),
         },
     }
 }
@@ -87,3 +100,25 @@ fn policy_pull() -> Result<()> {
     }
 }
 
+fn policy_open(inline: bool) -> Result<()> {
+    let base = panel_base();
+    let url = if inline { format!("{}/", base) } else { format!("{}/panel", base) };
+    webbrowser::open(&url).map(|_| ()).map_err(|e| anyhow!("no se pudo abrir navegador: {}", e))
+}
+
+fn policy_apply(file: &str) -> Result<()> {
+    let txt = std::fs::read_to_string(file)?;
+    let mut v: serde_json::Value = serde_json::from_str(&txt)?;
+    // permitir envoltura {"policy":{...}}
+    if let Some(p) = v.get("policy").cloned() { v = p; }
+    // guardar a disco
+    let paths = agent_core::paths::Paths::new()?;
+    std::fs::write(paths.policy_file(), serde_json::to_vec_pretty(&v)?)?;
+    std::fs::write(paths.policy_meta_file(), serde_json::to_vec_pretty(&serde_json::json!({"etag": null}))?)?;
+    // notificar al agente local para hot-apply
+    let base = panel_base();
+    let url = format!("{}/policy/apply", base);
+    let resp = Client::new().post(url).json(&v).send()?;
+    if resp.status().is_success() { println!("[ok] policy aplicada y guardada"); Ok(()) }
+    else { Err(anyhow!("falló aplicar en agente: {}", resp.status())) }
+}

@@ -11,3 +11,4 @@ serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 urlencoding = "2.1"
 agent-core = { path = "../agent-core" }
+webbrowser = "0.8"

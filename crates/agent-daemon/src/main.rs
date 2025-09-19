@@ -5,7 +5,7 @@ use agent_core::DEFAULT_PANEL_ADDR;
 use anyhow::Result;
 use axum::extract::{Query, State as AxumState};
 use axum::response::Html;
-use axum::routing::{get, get_service};
+use axum::routing::{get, get_service, post};
 use axum::Json;
 use axum::Router;
 // use axum::routing::get as ax_get;
@@ -133,7 +133,8 @@ async fn main() -> Result<()> {
         .route("/debug/sample", get(debug_sample_handler))
         .route("/debug/windows", get(debug_windows_handler))
         .route("/debug/window", get(debug_windows_handler))
-        .route("/debug/frontmost", get(debug_frontmost_handler));
+        .route("/debug/frontmost", get(debug_frontmost_handler))
+        .route("/policy/apply", post(policy_apply_handler));
     // Resolver carpeta de panel estático: PANEL_DIR, ./panel, o ../../panel (raíz del workspace)
     let static_dir = std::env::var("PANEL_DIR")
         .ok()
@@ -559,6 +560,22 @@ async fn debug_drops_handler(AxumState(ctx): AxumState<AppCtx>, Query(p): Query<
     let limit = p.limit.unwrap_or(50).min(500);
     let items = ctx.drop_log.list_desc(limit);
     Json(serde_json::json!({ "total": items.len(), "items": items }))
+}
+
+async fn policy_apply_handler(AxumState(ctx): AxumState<AppCtx>, axum::Json(body): axum::Json<serde_json::Value>) -> Json<serde_json::Value> {
+    // admitir envoltura {policy:{...}}
+    let pol_v = body.get("policy").cloned().unwrap_or(body);
+    match serde_json::from_value::<crate::policy::Policy>(pol_v) {
+        Ok(policy) => {
+            let st = crate::policy::PolicyState { policy, etag: None };
+            if let Err(e) = crate::policy::save_policy(&ctx.paths, &st) {
+                return Json(serde_json::json!({"ok": false, "error": format!("save failed: {}", e)}));
+            }
+            ctx.policy_rt.set(st);
+            Json(serde_json::json!({"ok": true}))
+        }
+        Err(e) => Json(serde_json::json!({"ok": false, "error": format!("parse failed: {}", e)})),
+    }
 }
 
 #[derive(Deserialize)]
