@@ -3,7 +3,7 @@ use agent_core::state::AgentState;
 use anyhow::Result;
 use serde::Serialize;
 use crate::policy::{PolicyRuntime, PolicyState};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{Glob, GlobSetBuilder};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +32,8 @@ pub async fn run_capture_loop(
     println!("[debug] capture loop started");
     let mut prev_app = String::new();
     let mut prev_title = String::new();
+    // Throttle state
+    let mut thr = Throttle::new();
     loop {
         debug!("capture tick");
         // Respetar pausa
@@ -46,6 +48,7 @@ pub async fn run_capture_loop(
                 debug!(app = ?app, title = ?title, idle_ms, "sample actual");
                 // Apply policy filters
                 let pol = policy_rt.get();
+                thr.update_from_policy(&pol.policy);
                 if should_drop(&pol, &app, &title) {
                     dropped_counter.fetch_add(1, Ordering::Relaxed);
                     sleep(Duration::from_millis(1000)).await;
@@ -56,6 +59,12 @@ pub async fn run_capture_loop(
                 let changed = app != prev_app || effective_title != prev_title;
                 let force_emit = should_force_emit(last_event_ts.load(Ordering::Relaxed));
                 if changed || force_emit {
+                    if !thr.permit(now) {
+                        dropped_counter.fetch_add(1, Ordering::Relaxed);
+                        // Throttled: no emit this tick
+                        sleep(Duration::from_millis(1000)).await;
+                        continue;
+                    }
                     let evt = CaptureEvent {
                         ts_ms: now_ms(),
                         app_name: app.clone(),
@@ -105,6 +114,42 @@ fn should_drop(pol: &PolicyState, app: &str, title: &str) -> bool {
         if let Ok(gs) = b.build() { if gs.is_match(title) { return true; } }
     }
     false
+}
+
+struct Throttle {
+    capacity: f64,
+    tokens: f64,
+    rate_per_sec: f64,
+    last_refill_ms: u64,
+    min_interval_ms: u64,
+    last_emit_ms: u64,
+}
+
+impl Throttle {
+    fn new() -> Self {
+        let mut t = Self { capacity: 10.0, tokens: 10.0, rate_per_sec: 10.0/60.0, last_refill_ms: now_ms(), min_interval_ms: 500, last_emit_ms: 0 };
+        t
+    }
+    fn update_from_policy(&mut self, pol: &crate::policy::Policy) {
+        if let Some(bpm) = pol.titleBurstPerMinute { let cap = bpm.max(1) as f64; self.capacity = cap; self.rate_per_sec = cap/60.0; if self.tokens > self.capacity { self.tokens = self.capacity; } }
+        if let Some(hz) = pol.titleSampleHz { let hz = hz.max(1) as u64; self.min_interval_ms = (1000 / hz).max(100); }
+    }
+    fn refill(&mut self, now: u64) {
+        let dt_ms = now.saturating_sub(self.last_refill_ms);
+        if dt_ms == 0 { return; }
+        let add = self.rate_per_sec * (dt_ms as f64)/1000.0;
+        self.tokens = (self.tokens + add).min(self.capacity);
+        self.last_refill_ms = now;
+    }
+    fn permit(&mut self, now: u64) -> bool {
+        self.refill(now);
+        if self.last_emit_ms != 0 && now.saturating_sub(self.last_emit_ms) < self.min_interval_ms { return false; }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            self.last_emit_ms = now;
+            true
+        } else { false }
+    }
 }
 
 #[cfg(target_os = "macos")]
