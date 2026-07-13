@@ -1,6 +1,7 @@
 pub mod paths;
 pub mod state;
 pub mod crypto;
+pub mod keystore;
 pub mod queue;
 pub mod metrics;
 pub mod auth;

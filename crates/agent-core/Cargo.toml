@@ -16,3 +16,8 @@ zstd = "0.13"
 tracing = "0.1"
 sysinfo = { version = "0.30" }
 tokio = { version = "1", features = ["rt", "time", "fs", "macros"] }
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
