@@ -12,12 +12,13 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 - **Tests: 0 en todo el workspace** (3960 líneas .rs, ningún `#[test]`). Viola la regla de calidad del repo.
 - **Build roto**: `cargo check --workspace` falla en macOS (`winreg` sin cfg gate en agent-ui-windows). Excluyéndolo compila con 88 warnings (100 clippy).
 - Plan anterior subreportaba Fase 5 (~60-70% hecha) y sobrereportaba items de cola/bootstrap; packaging completo sin trackear.
+- **Decisiones abiertas resueltas el 2026-07-13** (D1-D6): ver `docs/superpowers/specs/2026-07-13-plan-decisions-design.md`.
 
 ## SLOs (métricas objetivo)
-- [ ] CPU p95 ≤ 1% (medido solo macOS idle: p95≈0.13% ✓, `slo_mac.json`; falta Win/Linux y bajo carga)
+- [ ] CPU p95 ≤ 1% (medido solo macOS idle: p95≈0.13% ✓, `slo_mac.json`; falta Windows y bajo carga; Linux → v2)
 - [ ] RAM p95 ≤ 60 MB (medido solo macOS idle: p95≈16 MB ✓)
 - [ ] Pérdida de eventos < 0.1% (en riesgo: sin GC de cola ni límite de reintentos — ver P0)
-- [ ] Aplicación de política ≤ 10 s (hot-apply local sí; poll remoto es cada 300 s — ver Fase 2)
+- [ ] Aplicación de política ≤ 10 s (hot-apply local sí; decidido bajar poll remoto 300 s → 10 s, spec D4 — pendiente implementar)
 - [ ] MTTR por crash ≤ 5 s (sin watchdog; Fase 6 al 0%)
 
 ---
@@ -25,7 +26,7 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 ## P0 — Arreglos inmediatos (bloquean build/pruebas; antes de cualquier feature)
 - [ ] `agent-ui-windows/Cargo.toml:10`: mover `winreg` a `[target.'cfg(windows)'.dependencies]` — hoy rompe `cargo check --workspace` en macOS/Linux
 - [ ] `agent-login-macos`: agregarlo a workspace members (`Cargo.toml` raíz) y corregir `[bin]` → `[[bin]]` — hoy no compila, rompe `macos_pack.sh` y deja `dist/Ripor.app` sin RiporHelper.app (cadena login-item no testeable)
-- [ ] UI inline en `/`: `<script>` con bloque duplicado huérfano (`agent-daemon/src/main.rs:444-501`), SyntaxError confirmado — botones de permisos y "Refrescar política" muertos. Arreglar o eliminar la UI inline y quedarse solo con `/panel`
+- [ ] UI inline en `/`: `<script>` roto (SyntaxError, `main.rs:444-501`). **Decidido (D5): eliminar la UI inline** — `/` y `/ui` redirigen a `/panel`, panel embebido en el binario, botón "Refrescar política" pasa a `/panel`
 - [ ] Cola: incrementar `attempts` en reintentos + límite de reintentos + GC por tamaño/edad (`queue.rs` — hoy `attempts` es schema muerto; batch fallido reintenta para siempre, cola crece sin límite)
 - [ ] Limpieza: borrar `src/main.rs` raíz ("Hello, world!" muerto), `.gitignore` para `dist/` y `.DS_Store` (hoy hay 4.4 MB de binarios sin firma commiteados)
 - [ ] Reducir warnings (88 compilador / 100 clippy): dead code (`HeartbeatPayload`, `Throttled`, `screen_recording_allowed`), imports sin uso, statics mutables
@@ -33,9 +34,9 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 ---
 
 ## Seguridad — hallazgos de auditoría (pre-requisitos de los DoD de Fase 2 y de la sección Seguridad)
-- [ ] **Clave AES en `key.bin` plaintext world-readable** junto a `queue.sqlite` (`crypto.rs:25` no setea modo; `auth.rs` sí usa 0600). Mínimo: chmod 0600; objetivo: Keychain/DPAPI/libsecret
-- [ ] **Títulos de ventana en plaintext en logs rotativos** a nivel info (`capture.rs:179`) — anula el cifrado de la cola para el dato que protege. Bajar a debug o redactar títulos en logs
-- [ ] **`/debug/drops` expone títulos sensibles excluidos** por HTTP local (`main.rs:575-577`, `policy.rs:80-85`) — viola "títulos sensibles nunca salen del proceso". Redactar título o gatear el endpoint
+- [ ] **Clave AES en `key.bin` plaintext world-readable** junto a `queue.sqlite` (`crypto.rs:25`). **Decidido (D6): Keychain (macOS) / DPAPI (Windows) ahora**, fallback archivo 0600, migración automática de `key.bin`
+- [ ] **Títulos de ventana en plaintext en logs rotativos** a nivel info (`capture.rs:179`). **Decidido (D3): redactar título en logs salvo `RIPOR_DEBUG=1`**
+- [ ] **`/debug/drops` expone títulos sensibles excluidos** por HTTP local (`main.rs:575-577`, `policy.rs:80-85`). **Decidido (D3): título completo solo con `RIPOR_DEBUG=1`**; por defecto DropLog guarda app + razón + hash corto
 - [ ] **Forzar `https://` en `API_BASE_URL`** (hoy se consume raw, `net.rs:34,105,267`); políticas sin firma → canal de policy (killSwitch, titleCapture, excludes) spoofeable por MITM
 - [ ] **Guard de loopback en `PANEL_ADDR`** (hoy rebind a cualquier interfaz sin validación) + bloqueo CORS/Origin explícito
 - [ ] Contabilizar drops de `excludeExePaths` con su propia razón (hoy se cuentan como `excludedPattern`, `capture.rs`, distorsiona telemetría)
@@ -53,9 +54,8 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 
 ---
 
-## Decisión pendiente: alcance Linux
-Linux está al 0% real (captura stub `capture.rs:356-359`, sin tray, sin packaging, sin updater). Gran parte del pendiente global es Linux.
-- [ ] Decidir: ¿Linux en v1 o diferido? (si se difiere, Fases 1/5/6 se achican ~un tercio y el plan refleja el producto real: macOS+Windows primero)
+## Alcance v1 — decidido 2026-07-13 (D1)
+**v1 = macOS + Windows. Linux diferido a v2** (estaba al 0% real; ver sección "v2 — Linux" al final).
 
 ---
 
@@ -74,7 +74,7 @@ Tareas
 - [x] Script `scripts/slo_idle_check.py` (+ variante `.sh`)
 
 DoD
-- [ ] Arranque estable en Win/macOS/Linux sin elevación (macOS verificado; Win sin verificar; Linux inexistente)
+- [ ] Arranque estable en macOS/Windows sin elevación (macOS verificado; Win sin verificar; Linux → v2)
 - [x] Panel muestra versión y estado
 - [x] p95 CPU idle < 1% y RAM < 60 MB (macOS: 0.13% / 16 MB; falta Win/Linux)
 
@@ -86,9 +86,10 @@ Objetivo: app/título foreground, `inputIdleMs`, heartbeats 60 s.
 Tareas
 - [x] Windows: foreground + título + `GetLastInputInfo` (`capture.rs:521-699`; sin compilar/verificar en Windows real)
 - [x] macOS: AX focused app → CGWindowList → AXUIElement → NSWorkspace + idle CGEventSource (`capture.rs:302-347`)
-- [ ] Linux: X11/Wayland + idle (**stub total** — depende de decisión de alcance)
+- Linux: X11/Wayland + idle → **diferido a v2** (D1)
 - [x] Estado `ONLINE_ACTIVE/ONLINE_IDLE` (`main.rs:713-724`)
-- [x] Heartbeat 60 s, canal independiente de la cola (`net.rs:25-93`). Nota: se suprime si hubo evento en los últimos 60 s; body omite `device_id` (struct muerto `net.rs:16-23`) — decidir si es intencional
+- [x] Heartbeat 60 s, canal independiente de la cola (`net.rs:25-93`)
+- [ ] **Decidido (D2): heartbeat SIEMPRE** — quitar supresión cuando hay eventos (`net.rs:37-40`) y añadir `device_id` al body (struct muerto `net.rs:16-23`)
 - [x] Batch sender con backoff exponencial cap 60 s, borra solo en 2xx (`net.rs:103-241`). **Activado por `API_BASE_URL`** (no `EVENTS_URL` — corregir README que documenta vars stale)
 - [x] Endpoint `/queue` con preview descifrado
 - [x] macOS permisos: `/permissions`, `/permissions/prompt` (+ `/permissions/open/accessibility`, `/permissions/open/screen` — antes sin trackear)
@@ -120,7 +121,7 @@ Tareas
 DoD
 - [ ] Títulos sensibles nunca persisten ni salen del proceso (**violado hoy** por logs plaintext y `/debug/drops` — ver Seguridad)
 - [x] Panel muestra política efectiva y ETag
-- [ ] Cambios de política ≤ 10 s (solo con refresh manual; poll 300 s. Además el retry post-401 del policy loop descarta la respuesta — `net.rs:377` `let _ = r2.send()` — la policy fresca llega al ciclo siguiente)
+- [ ] Cambios de política ≤ 10 s — **decidido (D4): `POLICY_POLL_SECS` default 10 s** + fix del retry post-401 que descarta la respuesta (`net.rs:377`)
 - [x] Bootstrap completado, `agentToken` persistido/usable
 
 ---
@@ -171,14 +172,14 @@ Estado real: **~60-70% en macOS/Windows** (el plan anterior decía 0%).
 Tareas
 - [ ] Windows (parcial): tray + menú (Ver panel / Pausar 15/60 / Reanudar / autorun HKCU / Salir) ✓ (`agent-ui-windows/src/main.rs:22-90`); **falta Toast WinRT**
 - [ ] macOS (parcial): NSStatusItem + menú completo (política, permisos AX/Screen con estado, pausas, login item toggle, Salir) ✓ (`agent-ui-macos/src/main.rs:45-138`); **falta NSAlert en cambios de política**
-- [ ] Linux: AppIndicator + notify-rust (0% — depende de decisión de alcance)
-- [ ] Panel local completo (parcial: `/panel` SPA con refresh 2 s ✓; falta "últimos envíos", enforcement loopback y bloqueo CORS — ver Seguridad)
+- Linux: AppIndicator + notify-rust → **diferido a v2** (D1)
+- [ ] Panel local completo (parcial: `/panel` SPA con refresh 2 s ✓; falta "últimos envíos", enforcement loopback y bloqueo CORS — ver Seguridad. **D5: `/panel` pasa a ser la única UI**, embebida en binario; botón refrescar política migra aquí)
 - [ ] CLI (parcial): `agent policy open` abre panel ✓ (renombrar o alias a `privacy open`); **falta `agent pause --minutes N`** (el daemon ya soporta `/pause?minutes=N` y `/pause/clear` — solo falta el subcomando)
 - [x] Endpoints de pausa temporizada `/pause`, `/pause/clear` + `paused_until_ms` en `/state` (antes sin trackear)
 - [x] Login item macOS: SMAppService (shim ObjC `macos_loginitem.m`) + fallback LaunchAgent + `--print-login-state` (antes sin trackear)
 
 DoD
-- [ ] Tray visible siempre en los 3 SO (macOS/Windows implementado, autostart incluido; Linux 0%; "siempre" sin verificar en sesión real)
+- [ ] Tray visible siempre en macOS/Windows (implementado, autostart incluido; "siempre" sin verificar en sesión real; Linux → v2)
 - [x] Panel abre vía CLI y refleja estado near-real-time (refresh 2 s)
 
 ---
@@ -190,7 +191,7 @@ Tareas
 - [ ] Checksum SHA-256 del binario + manifiesto firmado (sha2 ya es dep, pero solo se usa para HMAC de requests)
 - [ ] Windows: servicio updater (elevación solo en apply) + delta patches
 - [ ] macOS: Sparkle 2 + Ed25519 (canales estable/beta)
-- [ ] Linux: updater + APT/YUM + verificación de firma
+- Linux: updater + APT/YUM + verificación de firma → **diferido a v2** (D1)
 - [ ] Watchdog (servicio SO) + `sentinel` para hangs (nota: `agent-login-macos` NO es esto — solo lanza el daemon al login y termina)
 - [ ] Detección debug (ptrace/IsDebuggerPresent) → `tamper=DEBUG_DETECTED` + modo solo-heartbeat
 - [ ] Rollback atómico + telemetría de update
@@ -266,7 +267,7 @@ DoD
 ---
 
 ## Riesgos y mitigaciones
-- [ ] Wayland/DE heterogéneos: pendiente de decisión de alcance Linux
+- Wayland/DE heterogéneos: **diferido a v2 con Linux** (D1)
 - [ ] Servicios de SO: macOS login-item ✓ (roto por P0); systemd user y servicio Windows 0%
 - [ ] Consumo: zstd nivel 3 ✓, throttle ✓; falta muestreo adaptativo y sleep extra en idle
 - [ ] OTA corrupto: N/A hasta que exista OTA (solo campo `updateChannel` sin uso en policy)
@@ -274,9 +275,17 @@ DoD
 ---
 
 ## Próximos pasos sugeridos (orden)
-1. P0 completo (build verde en los 3 targets de dev, cola con reintentos acotados)
-2. Hallazgos de seguridad 1-3 (clave, logs, /debug/drops) — baratos y cierran el DoD de Fase 2
+1. Implementar decisiones D5 → D2 → D4 → D3 → D6 (spec `docs/superpowers/specs/2026-07-13-plan-decisions-design.md`)
+2. P0 restante (winreg gate, agent-login-macos, cola con reintentos acotados, limpieza)
 3. Harness de tests + primeras 5 unidades puras
-4. Decisión de alcance Linux → re-dimensionar Fases 1/5/6
-5. Cerrar Fase 5 macOS/Windows (Toast, NSAlert, `agent pause`) — es lo más cerca de terminarse
-6. Fase 4 restante (mediaHint, ONLINE_PASSIVE, bucket por app)
+4. Cerrar Fase 5 macOS/Windows (Toast, NSAlert, `agent pause`) — es lo más cerca de terminarse
+5. Fase 4 restante (mediaHint, ONLINE_PASSIVE, bucket por app)
+
+---
+
+## v2 — Linux (diferido, decidido 2026-07-13, D1)
+- [ ] Captura X11/Wayland (preferir Wayland; fallback X11) + idle
+- [ ] Tray AppIndicator (libappindicator/ayatana) + notificaciones (notify-rust)
+- [ ] Packaging deb/rpm + updater con verificación de firma
+- [ ] Clave en libsecret
+- [ ] Riesgo Wayland/DE heterogéneos: detectar capacidades, documentar límites
