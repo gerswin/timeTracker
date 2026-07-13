@@ -109,6 +109,8 @@ async function refreshAll(){
 document.addEventListener('DOMContentLoaded', ()=>{
   $('btn-refresh-perms').onclick = refreshAll;
   $('btn-prompt-perms').onclick = ()=>fetchJson('/permissions/prompt').then(()=>setTimeout(refreshAll,1500));
+  const brp = $('btn-refresh-policy');
+  if(brp){ brp.onclick = ()=>fetch(BASE+'/policy/refresh',{method:'POST'}).then(()=>setTimeout(refreshAll,1000)); }
   refreshAll();
   setInterval(refreshAll, 2000);
 });

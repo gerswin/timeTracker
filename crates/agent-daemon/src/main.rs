@@ -120,8 +120,8 @@ async fn main() -> Result<()> {
 
     let app_ctx = ctx.clone();
     let base = Router::new()
-        .route("/", get(ui_index))
-        .route("/ui", get(ui_index))
+        .route("/", get(ui_redirect))
+        .route("/ui", get(ui_redirect))
         .route("/healthz", get(healthz))
         .route("/state", get(state_handler))
         .route("/queue", get(queue_handler))
@@ -144,35 +144,20 @@ async fn main() -> Result<()> {
         .route("/focus/blocks", get(focus_blocks_handler))
         .route("/focus/aggregate", get(focus_aggregate_handler))
         .route("/focus/aggregate.csv", get(focus_aggregate_csv_handler));
-    // Resolver carpeta de panel estático: PANEL_DIR, ./panel, o ../../panel (raíz del workspace)
-    let static_dir = std::env::var("PANEL_DIR")
+    // Panel: embebido en el binario; PANEL_DIR (si existe) lo overridea para desarrollo
+    let base = if let Some(static_dir) = std::env::var("PANEL_DIR")
         .ok()
         .map(std::path::PathBuf::from)
         .filter(|p| p.exists())
-        .or_else(|| {
-            let p = std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join("panel");
-            if p.exists() {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../panel");
-            if p.exists() {
-                Some(p)
-            } else {
-                None
-            }
-        });
-    let base = if let Some(static_dir) = static_dir {
+    {
         let svc =
             tower_http::services::ServeDir::new(static_dir).append_index_html_on_directories(true);
         base.nest_service("/panel", get_service(svc))
     } else {
-        base
+        base.route("/panel", get(panel_index))
+            .route("/panel/", get(panel_index))
+            .route("/panel/app.js", get(panel_app_js))
+            .route("/panel/styles.css", get(panel_styles))
     };
     let app = base.with_state(app_ctx);
 
@@ -298,220 +283,24 @@ async fn healthz(AxumState(ctx): AxumState<AppCtx>) -> Json<Healthz> {
     })
 }
 
-async fn ui_index() -> Html<&'static str> {
-    const HTML: &str = r#"<!doctype html>
-<html lang="es">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RiporAgent UI</title>
-    <style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;margin:0;background:#0f1116;color:#e6e6e6}
-      header{padding:12px 16px;background:#151922;border-bottom:1px solid #202534;display:flex;justify-content:space-between}
-      .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;padding:12px 16px}
-      .card{background:#151922;padding:10px;border:1px solid #202534;border-radius:8px}
-      .muted{color:#9aa3b2;font-size:12px}
-      pre{background:#151922;margin:12px 16px;padding:12px;border-radius:8px;border:1px solid #202534;max-height:320px;overflow:auto}
-      .ok{color:#22c55e}.warn{color:#eab308}.bad{color:#ef4444}
-    </style>
-  </head>
-  <body>
-    <header><h1>RiporAgent</h1><span id="ver"></span></header>
-    <div class="grid">
-      <div class="card"><div class="muted">Device ID</div><div id="device"></div></div>
-      <div class="card"><div class="muted">CPU %</div><div id="cpu"></div></div>
-      <div class="card"><div class="muted">RAM MB</div><div id="mem"></div></div>
-      <div class="card"><div class="muted">Idle ms</div><div id="idle"></div></div>
-      <div class="card"><div class="muted">Actividad</div><div id="act"></div></div>
-      <div class="card"><div class="muted">Monitoreo</div><div id="mon"></div></div>
-      <div class="card"><div class="muted">Cola</div><div id="qlen"></div></div>
-      <div class="card"><div class="muted">Descartes</div><div id="dropped"></div></div>
-      <div class="card"><div class="muted">Policy ETag</div><div id="petag"></div></div>
-    </div>
-    <div class="card" id="perms-card" style="margin:0 16px"><div class="muted">Permisos</div><div id="perms">—</div>
-      <div class="muted" style="margin-top:6px">Binario a autorizar:</div>
-      <div><code id="agent_path"></code></div>
-      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-        <button id="prompt">Solicitar permisos</button>
-        <button id="openAx">Abrir Accesibilidad</button>
-        <button id="openSc">Abrir Screen Recording</button>
-      </div>
-    </div>
-    <div class="card" style="margin:12px 16px"><div class="muted">Foco</div><div id="focus_consistency">—</div><pre id="focus">—</pre></div>
-    <pre id="queue">—</pre>
-    <div class="card" style="margin:12px 16px">
-      <div class="muted">Política efectiva</div>
-      <div style="margin:6px 0"><button id="btn-refresh-policy">Refrescar política</button></div>
-      <pre id="policy">—</pre>
-    </div>
-    <script>
-      async function j(u){const r=await fetch(u,{cache:'no-store'});if(!r.ok)throw new Error(u+':'+r.status);return r.json()}
-      async function ref(){
-        try{const s=await j('/state');
-          document.getElementById('ver').textContent='v'+s.agent_version;
-          document.getElementById('device').textContent=s.device_id;
-          document.getElementById('cpu').textContent=s.cpu_pct.toFixed(2);
-          document.getElementById('mem').textContent=s.mem_mb;
-          document.getElementById('idle').textContent=s.input_idle_ms;
-          document.getElementById('act').textContent=s.activity_state;
-          document.getElementById('qlen').textContent=s.queue_len;
-          document.getElementById('dropped').textContent=String(s.dropped_events||0);
-          document.getElementById('petag').textContent=s.policy_etag||'';
-                    const permsCard = document.getElementById('perms-card');
-          if(permsCard){
-            if(s.perms && s.perms.unsupported){
-              permsCard.style.display='none';
-            } else {
-              permsCard.style.display='';
-              if(s.perms && typeof s.perms.accessibility_ok !== 'undefined'){
-                document.getElementById('perms').innerHTML = 'Accessibility: <b>'+s.perms.accessibility_ok+'</b> - Screen Recording: <b>'+s.perms.screen_recording_ok+'</b>';
-              } else {
-                document.getElementById('perms').textContent='-';
-              }
-            }
-          }
-          document.getElementById('agent_path').textContent=s.agent_path;
-          const mon = document.getElementById('mon');
-          if(s.paused_until_ms && s.paused_until_ms > 0){
-            const d=new Date(Number(s.paused_until_ms)); mon.className='warn'; mon.textContent='Pausado hasta '+d.toLocaleTimeString();
-          } else { mon.className='ok'; mon.textContent='Monitoreo activo'; }
-        }catch(e){ console.error('state', e); }
-        try{const q=await j('/queue?limit=10'); document.getElementById('queue').textContent=JSON.stringify(q.top,null,2);}catch(e){ console.error('queue', e); }
-        try{const f=await j('/debug/sample');
-          const focusEl=document.getElementById('focus');
-          const consistencyEl=document.getElementById('focus_consistency');
-          if(f && f.unsupported){
-            focusEl.textContent='No disponible en este sistema';
-            consistencyEl.className='muted';
-            consistencyEl.textContent='';
-          } else if(f && f.error){
-            focusEl.textContent='Error: '+f.error;
-            consistencyEl.className='warn';
-            consistencyEl.textContent='Error al obtener foco';
-          } else {
-            if(Object.prototype.hasOwnProperty.call(f,'win_pid')){
-              const details={
-                app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
-                window_title:Object.prototype.hasOwnProperty.call(f,'window_title')?f.window_title:null,
-                title_source:Object.prototype.hasOwnProperty.call(f,'title_source')?f.title_source:null,
-                input_idle_ms:Object.prototype.hasOwnProperty.call(f,'input_idle_ms')?f.input_idle_ms:null,
-                win_pid:f.win_pid != null ? f.win_pid : null,
-                win_thread_id:f.win_thread_id != null ? f.win_thread_id : null,
-                win_hwnd:f.win_hwnd != null ? f.win_hwnd : null,
-                win_root_hwnd:f.win_root_hwnd != null ? f.win_root_hwnd : null,
-                win_class:f.win_class != null ? f.win_class : null,
-                win_process_path:f.win_process_path != null ? f.win_process_path : null,
-              };
-              focusEl.textContent=JSON.stringify(details,null,2);
-              consistencyEl.className='muted';
-              consistencyEl.textContent=f.title_source ? 'Fuente: '+f.title_source : '';
-            } else {
-              const details={
-                app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
-                window_title:Object.prototype.hasOwnProperty.call(f,'window_title')?f.window_title:null,
-                title_source:Object.prototype.hasOwnProperty.call(f,'title_source')?f.title_source:null,
-                input_idle_ms:Object.prototype.hasOwnProperty.call(f,'input_idle_ms')?f.input_idle_ms:null,
-                ax_name:f.ax_name ?? null,
-                ns_name:f.ns_name ?? null,
-                cg_owner:f.cg_owner ?? null,
-                cg_title:f.cg_title ?? null,
-                ax_title:f.ax_title ?? null,
-              };
-              focusEl.textContent=JSON.stringify(details,null,2);
-              const names=[f.ax_name,f.ns_name,f.cg_owner].filter(Boolean);
-              if(names.length>0 && names.every(n=>n===names[0])){
-                consistencyEl.className='ok';
-                consistencyEl.textContent='OK: AX/NS/CG concuerdan ('+names[0]+')';
-              } else if(names.length>0){
-                consistencyEl.className='warn';
-                consistencyEl.textContent='ATENCION: fuentes difieren - AX='+(f.ax_name||'N/A')+' / NS='+(f.ns_name||'N/A')+' / CG='+(f.cg_owner||'N/A');
-              } else {
-                consistencyEl.className='muted';
-                consistencyEl.textContent='Foco disponible (sin AX/NS/CG)';
-              }
-            }
-          }
-        }catch(e){ console.error('sample', e); }
-      }
-      document.addEventListener('DOMContentLoaded',()=>{
-        const btn=document.getElementById('prompt');
-        if(btn){ btn.onclick=()=>j('/permissions/prompt').then(()=>setTimeout(ref,1500)); }
-        const bax=document.getElementById('openAx'); if(bax){ bax.onclick=()=>j('/permissions/open/accessibility').then(()=>setTimeout(ref,1000)); }
-        const bsc=document.getElementById('openSc'); if(bsc){ bsc.onclick=()=>j('/permissions/open/screen').then(()=>setTimeout(ref,1000)); }
-        const brp=document.getElementById('btn-refresh-policy'); if(brp){ brp.onclick=()=>fetch('/policy/refresh',{method:'POST'}).then(()=>setTimeout(ref,1000)); }
-        ref(); setInterval(ref,2000);
-      });
-              try{document.getElementById('policy').textContent = JSON.stringify(s.policy||{},null,2);}catch(e){}
-        }catch(e){ console.error('state', e); }
-        try{const q=await j('/queue?limit=10'); document.getElementById('queue').textContent=JSON.stringify(q.top,null,2);}catch(e){ console.error('queue', e); }
-        try{const f=await j('/debug/sample');
-          const focusEl=document.getElementById('focus');
-          const consistencyEl=document.getElementById('focus_consistency');
-          if(f && f.unsupported){
-            focusEl.textContent='No disponible en este sistema';
-            consistencyEl.className='muted';
-            consistencyEl.textContent='';
-          } else if(f && f.error){
-            focusEl.textContent='Error: '+f.error;
-            consistencyEl.className='warn';
-            consistencyEl.textContent='Error al obtener foco';
-          } else {
-            if(Object.prototype.hasOwnProperty.call(f,'win_pid')){
-              const details={
-                app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
-                window_title:Object.prototype.hasOwnProperty.call(f,'window_title')?f.window_title:null,
-                title_source:Object.prototype.hasOwnProperty.call(f,'title_source')?f.title_source:null,
-                input_idle_ms:Object.prototype.hasOwnProperty.call(f,'input_idle_ms')?f.input_idle_ms:null,
-                win_pid:f.win_pid != null ? f.win_pid : null,
-                win_thread_id:f.win_thread_id != null ? f.win_thread_id : null,
-                win_hwnd:f.win_hwnd != null ? f.win_hwnd : null,
-                win_root_hwnd:f.win_root_hwnd != null ? f.win_root_hwnd : null,
-                win_class:f.win_class != null ? f.win_class : null,
-                win_process_path:f.win_process_path != null ? f.win_process_path : null,
-              };
-              focusEl.textContent=JSON.stringify(details,null,2);
-              consistencyEl.className='muted';
-              consistencyEl.textContent=f.title_source ? "Fuente: "+f.title_source : "";
-            } else {
-              const details={
-                app_name:Object.prototype.hasOwnProperty.call(f,'app_name')?f.app_name:null,
-                window_title:Object.prototype.hasOwnProperty.call(f,'window_title')?f.window_title:null,
-                title_source:Object.prototype.hasOwnProperty.call(f,'title_source')?f.title_source:null,
-                input_idle_ms:Object.prototype.hasOwnProperty.call(f,'input_idle_ms')?f.input_idle_ms:null,
-                ax_name:f.ax_name ?? null,
-                ns_name:f.ns_name ?? null,
-                cg_owner:f.cg_owner ?? null,
-                cg_title:f.cg_title ?? null,
-                ax_title:f.ax_title ?? null,
-              };
-              focusEl.textContent=JSON.stringify(details,null,2);
-              const names=[f.ax_name,f.ns_name,f.cg_owner].filter(Boolean);
-              if(names.length>0 && names.every(n=>n===names[0])){
-                consistencyEl.className='ok';
-                consistencyEl.textContent='OK: AX/NS/CG concuerdan ('+names[0]+')';
-              } else if(names.length>0){
-                consistencyEl.className='warn';
-                consistencyEl.textContent='ATENCION: fuentes difieren - AX='+(f.ax_name||'N/A')+' / NS='+(f.ns_name||'N/A')+' / CG='+(f.cg_owner||'N/A');
-              } else {
-                consistencyEl.className='muted';
-                consistencyEl.textContent='Foco disponible (sin AX/NS/CG)';
-              }
-            }
-          }
-        }catch(e){ console.error('sample', e); }
-      }
-      document.addEventListener('DOMContentLoaded',()=>{
-        const btn=document.getElementById('prompt');
-        if(btn){ btn.onclick=()=>j('/permissions/prompt').then(()=>setTimeout(ref,1500)); }
-        const bax=document.getElementById('openAx'); if(bax){ bax.onclick=()=>j('/permissions/open/accessibility').then(()=>setTimeout(ref,1000)); }
-        const bsc=document.getElementById('openSc'); if(bsc){ bsc.onclick=()=>j('/permissions/open/screen').then(()=>setTimeout(ref,1000)); }
-        ref(); setInterval(ref,2000);
-      });
-    </script>
-  </body>
-</html>
-"#;
-    Html(HTML)
+const PANEL_INDEX: &str = include_str!("../../../panel/index.html");
+const PANEL_APP_JS: &str = include_str!("../../../panel/app.js");
+const PANEL_CSS: &str = include_str!("../../../panel/styles.css");
+
+async fn ui_redirect() -> axum::response::Redirect {
+    axum::response::Redirect::temporary("/panel/")
+}
+
+async fn panel_index() -> Html<&'static str> {
+    Html(PANEL_INDEX)
+}
+
+async fn panel_app_js() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "application/javascript; charset=utf-8")], PANEL_APP_JS)
+}
+
+async fn panel_styles() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/css; charset=utf-8")], PANEL_CSS)
 }
 
 async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
@@ -930,5 +719,26 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn ui_redirige_a_panel() {
+        let resp = ui_redirect().await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(resp.headers().get("location").unwrap(), "/panel/");
+    }
+
+    #[test]
+    fn assets_del_panel_embebidos() {
+        assert!(PANEL_INDEX.contains("RiporAgent Panel"));
+        assert!(PANEL_INDEX.contains("btn-refresh-policy"));
+        assert!(PANEL_APP_JS.contains("refreshAll"));
+        assert!(!PANEL_CSS.is_empty());
     }
 }
