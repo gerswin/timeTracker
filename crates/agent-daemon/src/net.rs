@@ -22,6 +22,25 @@ struct HeartbeatPayload<'a> {
     mem_mb: u64,
 }
 
+fn heartbeat_body(
+    device_id: &str,
+    agent_version: &str,
+    last_event_ts: u64,
+    queue_len: i64,
+    cpu_pct: f32,
+    mem_mb: u64,
+) -> String {
+    serde_json::to_string(&HeartbeatPayload {
+        device_id,
+        agent_version,
+        last_event_ts,
+        queue_len,
+        cpu_pct,
+        mem_mb,
+    })
+    .expect("serializa heartbeat")
+}
+
 pub async fn run_heartbeat_loop(
     state: Arc<AgentState>,
     paths: &Paths,
@@ -35,36 +54,33 @@ pub async fn run_heartbeat_loop(
     loop {
         sleep(Duration::from_secs(60)).await;
         let last_evt = last_event_ts.load(Ordering::Relaxed);
-        if last_evt != 0 && now_ms().saturating_sub(last_evt) < 60_000 {
-            continue; // hubo eventos recientes; sin heartbeat
-        }
         let queue_len = match agent_core::queue::Queue::open(paths, &state) {
             Ok(q) => q.queue_len().unwrap_or(0),
             Err(_) => 0,
         };
-        let _m = metrics.get();
+        let m = metrics.get();
         if let Some(base) = api_base.as_deref() {
             if let Some(secrets) = AgentSecrets::load(paths).ok().flatten() {
-                let body = serde_json::json!({
-                    "status": "running",
-                    "uptime_seconds": 0,
-                    "last_activity_ms": last_evt,
-                    "agent_version": state.agent_version,
-                });
-                let body_str = serde_json::to_string(&body).unwrap();
+                let body_str = heartbeat_body(
+                    secrets.device_id.as_deref().unwrap_or(&state.device_id),
+                    &state.agent_version,
+                    last_evt,
+                    queue_len,
+                    m.cpu_pct,
+                    m.mem_mb,
+                );
                 let sig = hmac_hex(&secrets.server_salt, body_str.as_bytes());
                 let url = format!("{}/v1/agents/heartbeat", base.trim_end_matches('/'));
                 if std::env::var("RIPOR_DEBUG_INGEST").ok().as_deref() == Some("1") {
                     debug!(payload=%body_str, url=%url, "heartbeat payload");
                 }
-                let mut sent = false;
                 match client.post(url.clone())
                     .header("Content-Type", "application/json")
                     .header("Agent-Token", secrets.agent_token.clone())
                     .header("X-Body-HMAC", sig.clone())
                     .body(body_str.clone())
                     .send().await {
-                    Ok(resp) if resp.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); sent = true; }
+                    Ok(resp) if resp.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); }
                     Ok(resp) if resp.status().as_u16() == 401 => {
                         if let Some(newsec) = rebootstrap(paths, &state).await {
                             let sig2 = hmac_hex(&newsec.server_salt, body_str.as_bytes());
@@ -74,7 +90,7 @@ pub async fn run_heartbeat_loop(
                                 .header("X-Body-HMAC", sig2)
                                 .body(body_str)
                                 .send().await {
-                                Ok(r2) if r2.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); sent = true; }
+                                Ok(r2) if r2.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); }
                                 Ok(r2) => warn!(status=?r2.status(), "heartbeat tras re-bootstrap falló"),
                                 Err(e2) => warn!(?e2, "heartbeat error red tras re-bootstrap"),
                             }
@@ -406,5 +422,21 @@ pub async fn fetch_policy_once(paths: &Paths, rt: std::sync::Arc<PolicyRuntime>)
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_body_incluye_device_id() {
+        let body = heartbeat_body("dev-123", "0.1.0", 42, 7, 1.5, 20);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["device_id"], "dev-123");
+        assert_eq!(v["agent_version"], "0.1.0");
+        assert_eq!(v["last_event_ts"], 42);
+        assert_eq!(v["queue_len"], 7);
+        assert_eq!(v["mem_mb"], 20);
     }
 }
