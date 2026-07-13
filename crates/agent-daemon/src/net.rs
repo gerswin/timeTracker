@@ -201,7 +201,11 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
         let sig = hmac_hex(&secrets.server_salt, body_str.as_bytes());
         let url = format!("{}/v1/events:ingest", api_base.trim_end_matches('/'));
         if std::env::var("RIPOR_DEBUG_INGEST").ok().as_deref() == Some("1") {
-            debug!(payload=%body_str, url=%url, count=%events_json.len(), "ingest payload");
+            if std::env::var("RIPOR_DEBUG").ok().as_deref() == Some("1") {
+                debug!(payload=%body_str, url=%url, count=%events_json.len(), "ingest payload");
+            } else {
+                debug!(url=%url, count=%events_json.len(), "ingest payload (body omitido; títulos completos solo con RIPOR_DEBUG=1)");
+            }
         }
         let mut ok_sent = false;
         match client.post(url.clone())

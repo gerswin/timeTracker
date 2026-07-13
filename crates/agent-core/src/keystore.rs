@@ -2,6 +2,9 @@ use crate::paths::{ensure_parent, Paths};
 use anyhow::{anyhow, Result};
 use rand::RngCore;
 use std::fs;
+use std::sync::OnceLock;
+
+static KEY_CACHE: OnceLock<[u8; KEY_LEN]> = OnceLock::new();
 
 pub const KEY_LEN: usize = 32;
 const SERVICE: &str = "com.ripor.RiporAgent";
@@ -32,7 +35,11 @@ impl KeyBackend for OsKeystore {
 }
 
 pub fn load_or_create_key(paths: &Paths) -> Result<[u8; KEY_LEN]> {
-    load_or_create_key_with(&OsKeystore, paths)
+    if let Some(k) = KEY_CACHE.get() {
+        return Ok(*k);
+    }
+    let k = load_or_create_key_with(&OsKeystore, paths)?;
+    Ok(*KEY_CACHE.get_or_init(|| k))
 }
 
 pub fn load_or_create_key_with(backend: &dyn KeyBackend, paths: &Paths) -> Result<[u8; KEY_LEN]> {
@@ -63,16 +70,23 @@ pub fn load_or_create_key_with(backend: &dyn KeyBackend, paths: &Paths) -> Resul
             tracing::warn!(?e, "keystore set falló; se mantiene key.bin");
             return Ok(k);
         }
-        fs::remove_file(&legacy)?;
+        if let Err(e) = fs::remove_file(&legacy) {
+            tracing::warn!(?e, "no se pudo borrar key.bin tras migrar; la clave ya está en el keystore");
+        }
         tracing::info!("clave migrada de key.bin al keystore del SO");
         return Ok(k);
     }
-    // 3) generar nueva
+    // 3) generar nueva — jamás sobre datos cifrados previos
+    if paths.queue_db().exists() {
+        return Err(anyhow!(
+            "keystore sin clave y existen datos cifrados previos (queue.sqlite); no se genera clave nueva para no dejar la cola indescifrable"
+        ));
+    }
     let mut k = [0u8; KEY_LEN];
     rand::thread_rng().fill_bytes(&mut k);
     if let Err(e) = backend.set(&k) {
         tracing::warn!(?e, "keystore set falló; fallback a archivo 0600");
-        return file_key_fallback(paths, true);
+        return file_key_fallback(paths, !paths.queue_db().exists());
     }
     Ok(k)
 }
@@ -221,6 +235,14 @@ mod tests {
         std::fs::write(paths.queue_db(), b"datos").unwrap(); // simula cola previa
         let res = load_or_create_key_with(&FailBackend, &paths);
         assert!(res.is_err(), "no debe generar clave nueva con datos cifrados previos y sin key file");
+    }
+
+    #[test]
+    fn keystore_vacio_con_datos_previos_no_fabrica_clave() {
+        let (_d, paths) = tmp_paths();
+        std::fs::write(paths.queue_db(), b"datos").unwrap();
+        let res = load_or_create_key_with(&MemBackend::new(), &paths);
+        assert!(res.is_err(), "keystore vacío + datos previos + sin key file no debe fabricar clave");
     }
 
     #[test]
