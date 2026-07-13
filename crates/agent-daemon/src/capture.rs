@@ -107,7 +107,7 @@ pub async fn run_capture_loop(
         match sample_once() {
             Ok((app, title, idle_ms)) => {
                 last_idle_ms.store(idle_ms, Ordering::Relaxed);
-                debug!(app = ?app, title = ?title, idle_ms, "sample actual");
+                debug!(app = ?app, title = %crate::policy::redact_title(&title), idle_ms, "sample actual");
                 // Apply policy filters
                 let pol = policy_rt.get();
                 thr.update_from_policy(&pol.policy);
@@ -120,7 +120,7 @@ pub async fn run_capture_loop(
                         DropReason::ExcludedPattern => drop_counters.excluded_pattern.fetch_add(1, Ordering::Relaxed),
                         DropReason::Throttled => drop_counters.throttled.fetch_add(1, Ordering::Relaxed),
                     };
-                    drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: match reason { DropReason::KillSwitch=>"killSwitch", DropReason::PauseCapture=>"pauseCapture", DropReason::ExcludedApp=>"excludedApp", DropReason::ExcludedPattern=>"excludedPattern", DropReason::Throttled=>"throttled" }.to_string(), app: app.clone(), title: title.clone() });
+                    drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: match reason { DropReason::KillSwitch=>"killSwitch", DropReason::PauseCapture=>"pauseCapture", DropReason::ExcludedApp=>"excludedApp", DropReason::ExcludedPattern=>"excludedPattern", DropReason::Throttled=>"throttled" }.to_string(), app: app.clone(), title: crate::policy::redact_title(&title) });
                     sleep(Duration::from_millis(1000)).await;
                     continue;
                 }
@@ -132,7 +132,7 @@ pub async fn run_capture_loop(
                     if !thr.permit(now, force_emit) {
                         dropped_counter.fetch_add(1, Ordering::Relaxed);
                         drop_counters.throttled.fetch_add(1, Ordering::Relaxed);
-                        drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: "throttled".into(), app: app.clone(), title: effective_title.clone() });
+                        drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: "throttled".into(), app: app.clone(), title: crate::policy::redact_title(&effective_title) });
                         // Throttled: no emit this tick
                         sleep(Duration::from_millis(1000)).await;
                         continue;
@@ -176,7 +176,7 @@ pub async fn run_capture_loop(
                     if let Ok(q) = Queue::open(paths, &state) {
                         if let Ok(_) = q.enqueue_json(&serde_json::to_vec(&evt).unwrap()) {
                             last_event_ts.store(evt.ts_ms, Ordering::Relaxed);
-                            info!(app = ?evt.app_name, title = ?evt.window_title, "captura encolada");
+                            info!(app = ?evt.app_name, title = %crate::policy::redact_title(&evt.window_title), "captura encolada");
                         } else {
                             warn!("falló enqueue captura");
                         }
