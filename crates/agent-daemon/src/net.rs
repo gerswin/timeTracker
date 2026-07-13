@@ -349,6 +349,41 @@ async fn rebootstrap(paths: &Paths, state: &AgentState) -> Option<AgentSecrets> 
     }
 }
 
+fn poll_secs_from(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(10)
+}
+
+fn policy_poll_secs() -> u64 {
+    poll_secs_from(std::env::var("POLICY_POLL_SECS").ok().as_deref())
+}
+
+async fn apply_policy_response(resp: reqwest::Response, paths: &Paths, rt: &PolicyRuntime) {
+    let hdr = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => {
+            let polv = v.get("policy").cloned().unwrap_or(v);
+            match serde_json::from_value::<crate::policy::Policy>(polv) {
+                Ok(policy) => {
+                    let st = PolicyState { policy, etag: hdr };
+                    if let Err(e) = save_policy(paths, &st) {
+                        warn!(?e, "no se pudo guardar policy");
+                    }
+                    rt.set(st);
+                    info!("policy actualizada");
+                }
+                Err(e) => warn!(?e, "parse policy fallo"),
+            }
+        }
+        Err(e) => warn!(?e, "parse json en policy fallo"),
+    }
+}
+
 pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
     // load initial from disk
     let initial = load_policy(paths);
@@ -366,23 +401,7 @@ pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
         match req.send().await {
             Ok(resp) if resp.status().as_u16() == 304 => { /* unchanged */ }
             Ok(resp) if resp.status().is_success() => {
-                let hdr = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-                match resp.json::<serde_json::Value>().await {
-                    Ok(v) => {
-                        // soporta respuesta con campo policy o directamente la policy rica
-                        let polv = v.get("policy").cloned().unwrap_or(v);
-                        match serde_json::from_value::<crate::policy::Policy>(polv) {
-                            Ok(policy) => {
-                                let st = PolicyState { policy, etag: hdr };
-                                if let Err(e) = save_policy(paths, &st) { warn!(?e, "no se pudo guardar policy"); }
-                                rt.set(st);
-                                info!("policy actualizada");
-                            }
-                            Err(e) => warn!(?e, "parse policy fallo"),
-                        }
-                    }
-                    Err(e) => warn!(?e, "parse json en policy fallo"),
-                }
+                apply_policy_response(resp, paths, &rt).await;
             }
             Ok(resp) if resp.status().as_u16() == 401 => {
                 // try rebootstrap then retry once
@@ -390,13 +409,20 @@ pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
                     let url2 = format!("{}/v1/policy/{}", base.trim_end_matches('/'), urlencoding::encode(&user));
                     let mut r2 = client.get(url2).header("Agent-Token", ns.agent_token);
                     if let Some(tag) = etag.as_deref() { r2 = r2.header("If-None-Match", tag); }
-                    let _ = r2.send().await; // siguiente ciclo parseará
+                    match r2.send().await {
+                        Ok(r2resp) if r2resp.status().as_u16() == 304 => { /* sin cambios */ }
+                        Ok(r2resp) if r2resp.status().is_success() => {
+                            apply_policy_response(r2resp, paths, &rt).await;
+                        }
+                        Ok(r2resp) => warn!(status=?r2resp.status(), "policy tras re-bootstrap falló"),
+                        Err(e2) => warn!(?e2, "policy error red tras re-bootstrap"),
+                    }
                 }
             }
             Ok(resp) => warn!(status=?resp.status(), "policy fallo"),
             Err(e) => warn!(?e, "policy error red"),
         }
-        sleep(Duration::from_secs(300)).await;
+        sleep(Duration::from_secs(policy_poll_secs())).await;
     }
 }
 
@@ -438,5 +464,21 @@ mod tests {
         assert_eq!(v["last_event_ts"], 42);
         assert_eq!(v["queue_len"], 7);
         assert_eq!(v["mem_mb"], 20);
+    }
+
+    #[test]
+    fn poll_secs_default_es_10() {
+        assert_eq!(poll_secs_from(None), 10);
+    }
+
+    #[test]
+    fn poll_secs_lee_valor_valido() {
+        assert_eq!(poll_secs_from(Some("60")), 60);
+    }
+
+    #[test]
+    fn poll_secs_rechaza_invalidos() {
+        assert_eq!(poll_secs_from(Some("abc")), 10);
+        assert_eq!(poll_secs_from(Some("0")), 10);
     }
 }
