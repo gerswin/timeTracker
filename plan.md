@@ -18,7 +18,7 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 - [ ] CPU p95 ≤ 1% (medido solo macOS idle: p95≈0.13% ✓, `slo_mac.json`; falta Windows y bajo carga; Linux → v2)
 - [ ] RAM p95 ≤ 60 MB (medido solo macOS idle: p95≈16 MB ✓)
 - [ ] Pérdida de eventos < 0.1% (en riesgo: sin GC de cola ni límite de reintentos — ver P0)
-- [ ] Aplicación de política ≤ 10 s (hot-apply local sí; decidido bajar poll remoto 300 s → 10 s, spec D4 — pendiente implementar)
+- [ ] Aplicación de política ≤ 10 s (implementado POLICY_POLL_SECS=10 + fix retry 401; falta verificación E2E con backend real)
 - [ ] MTTR por crash ≤ 5 s (sin watchdog; Fase 6 al 0%)
 
 ---
@@ -26,7 +26,7 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 ## P0 — Arreglos inmediatos (bloquean build/pruebas; antes de cualquier feature)
 - [ ] `agent-ui-windows/Cargo.toml:10`: mover `winreg` a `[target.'cfg(windows)'.dependencies]` — hoy rompe `cargo check --workspace` en macOS/Linux
 - [ ] `agent-login-macos`: agregarlo a workspace members (`Cargo.toml` raíz) y corregir `[bin]` → `[[bin]]` — hoy no compila, rompe `macos_pack.sh` y deja `dist/Ripor.app` sin RiporHelper.app (cadena login-item no testeable)
-- [ ] UI inline en `/`: `<script>` roto (SyntaxError, `main.rs:444-501`). **Decidido (D5): eliminar la UI inline** — `/` y `/ui` redirigen a `/panel`, panel embebido en el binario, botón "Refrescar política" pasa a `/panel`
+- [x] UI inline en `/`: `<script>` roto (SyntaxError, `main.rs:444-501`). **Decidido (D5): eliminar la UI inline** — `/` y `/ui` redirigen a `/panel`, panel embebido en el binario, botón "Refrescar política" pasa a `/panel` (hecho: `/` y `/ui` redirigen, panel embebido; `/panel` está embebido en el binario con override `PANEL_DIR`)
 - [ ] Cola: incrementar `attempts` en reintentos + límite de reintentos + GC por tamaño/edad (`queue.rs` — hoy `attempts` es schema muerto; batch fallido reintenta para siempre, cola crece sin límite)
 - [ ] Limpieza: borrar `src/main.rs` raíz ("Hello, world!" muerto), `.gitignore` para `dist/` y `.DS_Store` (hoy hay 4.4 MB de binarios sin firma commiteados)
 - [ ] Reducir warnings (88 compilador / 100 clippy): dead code (`HeartbeatPayload`, `Throttled`, `screen_recording_allowed`), imports sin uso, statics mutables
@@ -34,9 +34,9 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 ---
 
 ## Seguridad — hallazgos de auditoría (pre-requisitos de los DoD de Fase 2 y de la sección Seguridad)
-- [ ] **Clave AES en `key.bin` plaintext world-readable** junto a `queue.sqlite` (`crypto.rs:25`). **Decidido (D6): Keychain (macOS) / DPAPI (Windows) ahora**, fallback archivo 0600, migración automática de `key.bin`
-- [ ] **Títulos de ventana en plaintext en logs rotativos** a nivel info (`capture.rs:179`). **Decidido (D3): redactar título en logs salvo `RIPOR_DEBUG=1`**
-- [ ] **`/debug/drops` expone títulos sensibles excluidos** por HTTP local (`main.rs:575-577`, `policy.rs:80-85`). **Decidido (D3): título completo solo con `RIPOR_DEBUG=1`**; por defecto DropLog guarda app + razón + hash corto
+- [x] **Clave AES en `key.bin` plaintext world-readable** junto a `queue.sqlite` (`crypto.rs:25`). **Decidido (D6): Keychain (macOS) / DPAPI (Windows) ahora**, fallback archivo 0600, migración automática de `key.bin` (keystore vía keyring + fallback 0600 + migración key.bin)
+- [x] **Títulos de ventana en plaintext en logs rotativos** a nivel info (`capture.rs:179`). **Decidido (D3): redactar título en logs salvo `RIPOR_DEBUG=1`** (redacción salvo RIPOR_DEBUG=1)
+- [x] **`/debug/drops` expone títulos sensibles excluidos** por HTTP local (`main.rs:575-577`, `policy.rs:80-85`). **Decidido (D3): título completo solo con `RIPOR_DEBUG=1`**; por defecto DropLog guarda app + razón + hash corto (DropLog redactado por defecto)
 - [ ] **Forzar `https://` en `API_BASE_URL`** (hoy se consume raw, `net.rs:34,105,267`); políticas sin firma → canal de policy (killSwitch, titleCapture, excludes) spoofeable por MITM
 - [ ] **Guard de loopback en `PANEL_ADDR`** (hoy rebind a cualquier interfaz sin validación) + bloqueo CORS/Origin explícito
 - [ ] Contabilizar drops de `excludeExePaths` con su propia razón (hoy se cuentan como `excludedPattern`, `capture.rs`, distorsiona telemetría)
@@ -89,7 +89,7 @@ Tareas
 - Linux: X11/Wayland + idle → **diferido a v2** (D1)
 - [x] Estado `ONLINE_ACTIVE/ONLINE_IDLE` (`main.rs:713-724`)
 - [x] Heartbeat 60 s, canal independiente de la cola (`net.rs:25-93`)
-- [ ] **Decidido (D2): heartbeat SIEMPRE** — quitar supresión cuando hay eventos (`net.rs:37-40`) y añadir `device_id` al body (struct muerto `net.rs:16-23`)
+- [x] **Decidido (D2): heartbeat SIEMPRE** — quitar supresión cuando hay eventos (`net.rs:37-40`) y añadir `device_id` al body (struct muerto `net.rs:16-23`) (implementado; body serializa HeartbeatPayload)
 - [x] Batch sender con backoff exponencial cap 60 s, borra solo en 2xx (`net.rs:103-241`). **Activado por `API_BASE_URL`** (no `EVENTS_URL` — corregir README que documenta vars stale)
 - [x] Endpoint `/queue` con preview descifrado
 - [x] macOS permisos: `/permissions`, `/permissions/prompt` (+ `/permissions/open/accessibility`, `/permissions/open/screen` — antes sin trackear)
@@ -121,7 +121,7 @@ Tareas
 DoD
 - [ ] Títulos sensibles nunca persisten ni salen del proceso (**violado hoy** por logs plaintext y `/debug/drops` — ver Seguridad)
 - [x] Panel muestra política efectiva y ETag
-- [ ] Cambios de política ≤ 10 s — **decidido (D4): `POLICY_POLL_SECS` default 10 s** + fix del retry post-401 que descarta la respuesta (`net.rs:377`)
+- [ ] Cambios de política ≤ 10 s — (implementado POLICY_POLL_SECS=10 + fix retry 401; falta verificación E2E con backend real)
 - [x] Bootstrap completado, `agentToken` persistido/usable
 
 ---
@@ -173,7 +173,7 @@ Tareas
 - [ ] Windows (parcial): tray + menú (Ver panel / Pausar 15/60 / Reanudar / autorun HKCU / Salir) ✓ (`agent-ui-windows/src/main.rs:22-90`); **falta Toast WinRT**
 - [ ] macOS (parcial): NSStatusItem + menú completo (política, permisos AX/Screen con estado, pausas, login item toggle, Salir) ✓ (`agent-ui-macos/src/main.rs:45-138`); **falta NSAlert en cambios de política**
 - Linux: AppIndicator + notify-rust → **diferido a v2** (D1)
-- [ ] Panel local completo (parcial: `/panel` SPA con refresh 2 s ✓; falta "últimos envíos", enforcement loopback y bloqueo CORS — ver Seguridad. **D5: `/panel` pasa a ser la única UI**, embebida en binario; botón refrescar política migra aquí)
+- [ ] Panel local completo (parcial: `/panel` SPA con refresh 2 s ✓; falta "últimos envíos", enforcement loopback y bloqueo CORS — ver Seguridad. **D5 implementado**: la UI inline ya no existe; `/panel` embebido en el binario es la única UI, botón refrescar política vive ahí)
 - [ ] CLI (parcial): `agent policy open` abre panel ✓ (renombrar o alias a `privacy open`); **falta `agent pause --minutes N`** (el daemon ya soporta `/pause?minutes=N` y `/pause/clear` — solo falta el subcomando)
 - [x] Endpoints de pausa temporizada `/pause`, `/pause/clear` + `paused_until_ms` en `/state` (antes sin trackear)
 - [x] Login item macOS: SMAppService (shim ObjC `macos_loginitem.m`) + fallback LaunchAgent + `--print-login-state` (antes sin trackear)
@@ -242,7 +242,7 @@ DoD
 ## Inventario real de superficie (antes sin trackear — mantener sincronizado)
 - Endpoints daemon: `/healthz`, `/state`, `/queue`, `/panel` (SPA estática), `/` y `/ui` (inline, rota — P0), `/pause`, `/pause/clear`, `/policy/apply`, `/policy/refresh`, `/focus/blocks`, `/focus/aggregate[.csv]`, `/permissions[/prompt|/open/*]`, `/debug/drops`, `/debug/sample|windows|window|frontmost`
 - CLI: `agent policy show|pull|open|apply|edit|refresh` (faltan: `pause`, `privacy open`, `diag`)
-- Config: `.env` (`API_BASE_URL`, `PANEL_ADDR`, `IDLE_ACTIVE_THRESHOLD_MS`, `RIPOR_NO_AUTO_PROMPT`, `RIPOR_DEBUG_INGEST`…) — README documenta vars stale `EVENTS_URL`/`HEARTBEAT_URL`, corregir
+- Config: `.env` (`API_BASE_URL`, `PANEL_ADDR`, `IDLE_ACTIVE_THRESHOLD_MS`, `RIPOR_NO_AUTO_PROMPT`, `RIPOR_DEBUG_INGEST`, `POLICY_POLL_SECS`, `RIPOR_DEBUG`…) — README documenta vars stale `EVENTS_URL`/`HEARTBEAT_URL`, corregir
 - Scripts: `smoke.sh`, `slo_idle_check.py|.sh`, `win_run.ps1`, `win_smoke.ps1`, `macos_pack|sign|notarize.sh`
 
 ---
