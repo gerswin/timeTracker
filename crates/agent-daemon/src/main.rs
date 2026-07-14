@@ -352,6 +352,7 @@ async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
             "pauseCapture": dc.pause.load(Ordering::Relaxed),
             "excludedApp": dc.excluded_app.load(Ordering::Relaxed),
             "excludedPattern": dc.excluded_pattern.load(Ordering::Relaxed),
+            "excludedExePath": dc.excluded_exe_path.load(Ordering::Relaxed),
             "throttled": dc.throttled.load(Ordering::Relaxed),
         }),
         focus_blocks: ctx.focus_agg.recent(5, ctx.policy_rt.get().policy.focusMinMinutes.unwrap_or(5)),

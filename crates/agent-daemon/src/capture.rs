@@ -118,9 +118,10 @@ pub async fn run_capture_loop(
                         DropReason::PauseCapture => drop_counters.pause.fetch_add(1, Ordering::Relaxed),
                         DropReason::ExcludedApp => drop_counters.excluded_app.fetch_add(1, Ordering::Relaxed),
                         DropReason::ExcludedPattern => drop_counters.excluded_pattern.fetch_add(1, Ordering::Relaxed),
+                        DropReason::ExcludedExePath => drop_counters.excluded_exe_path.fetch_add(1, Ordering::Relaxed),
                         DropReason::Throttled => drop_counters.throttled.fetch_add(1, Ordering::Relaxed),
                     };
-                    drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: match reason { DropReason::KillSwitch=>"killSwitch", DropReason::PauseCapture=>"pauseCapture", DropReason::ExcludedApp=>"excludedApp", DropReason::ExcludedPattern=>"excludedPattern", DropReason::Throttled=>"throttled" }.to_string(), app: app.clone(), title: crate::policy::redact_title(&title) });
+                    drop_log.push(crate::policy::DropEvent { ts_ms: now_ms(), reason: match reason { DropReason::KillSwitch=>"killSwitch", DropReason::PauseCapture=>"pauseCapture", DropReason::ExcludedApp=>"excludedApp", DropReason::ExcludedPattern=>"excludedPattern", DropReason::ExcludedExePath=>"excludedExePath", DropReason::Throttled=>"throttled" }.to_string(), app: app.clone(), title: crate::policy::redact_title(&title) });
                     sleep(Duration::from_millis(1000)).await;
                     continue;
                 }
@@ -203,12 +204,13 @@ fn should_force_emit(last_ts: u64) -> bool {
     now.saturating_sub(last_ts) > 30_000
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 enum DropReason {
     KillSwitch,
     PauseCapture,
     ExcludedApp,
     ExcludedPattern,
+    ExcludedExePath,
     // Never constructed by drop_reason(): the throttle-drop path below logs
     // "throttled" directly without going through this enum. Kept (not
     // deleted) since the match arms below already handle it exhaustively.
@@ -217,6 +219,13 @@ enum DropReason {
 }
 
 fn drop_reason(pol: &PolicyState, app: &str, title: &str) -> Option<DropReason> {
+    let exe = if pol.policy.excludeExePaths.is_empty() { None } else { front_exe_identity() };
+    drop_reason_with(pol, app, title, exe.as_deref())
+}
+
+// Pure classification, separated from drop_reason() so it can be unit-tested
+// without going through platform FFI (front_exe_identity()).
+fn drop_reason_with(pol: &PolicyState, app: &str, title: &str, exe_identity: Option<&str>) -> Option<DropReason> {
     let p = &pol.policy;
     if p.killSwitch { return Some(DropReason::KillSwitch); }
     if p.pauseCapture { return Some(DropReason::PauseCapture); }
@@ -229,10 +238,10 @@ fn drop_reason(pol: &PolicyState, app: &str, title: &str) -> Option<DropReason> 
         if let Ok(gs) = b.build() { if gs.is_match(title) { return Some(DropReason::ExcludedPattern); } }
     }
     if !p.excludeExePaths.is_empty() {
-        if let Some(exe) = front_exe_identity() {
+        if let Some(exe) = exe_identity {
             let mut b = GlobSetBuilder::new();
             for pat in &p.excludeExePaths { if let Ok(g) = Glob::new(pat) { b.add(g); } }
-            if let Ok(gs) = b.build() { if gs.is_match(&exe) { return Some(DropReason::ExcludedPattern); } }
+            if let Ok(gs) = b.build() { if gs.is_match(exe) { return Some(DropReason::ExcludedExePath); } }
         }
     }
     None
@@ -1198,5 +1207,159 @@ fn perms_diag_once() {
         println!(
             "[hint] Títulos vacíos: permisos macOS. Revisa http://127.0.0.1:49219/permissions y usa http://127.0.0.1:49219/permissions/prompt"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::Policy;
+
+    fn state(policy: Policy) -> PolicyState {
+        PolicyState { policy, etag: None }
+    }
+
+    #[test]
+    fn clean_policy_drops_nothing() {
+        let pol = state(Policy::default());
+        assert_eq!(drop_reason_with(&pol, "Safari", "hello", None), None);
+    }
+
+    #[test]
+    fn kill_switch_wins_over_everything() {
+        let mut p = Policy::default();
+        p.killSwitch = true;
+        p.pauseCapture = true;
+        p.excludeApps = vec!["Safari".into()];
+        p.excludePatterns = vec!["*Banco*".into()];
+        p.excludeExePaths = vec!["com.apple.*".into()];
+        let pol = state(p);
+        assert_eq!(
+            drop_reason_with(&pol, "Safari", "Banco Secreto", Some("com.apple.Terminal")),
+            Some(DropReason::KillSwitch)
+        );
+    }
+
+    #[test]
+    fn pause_capture_wins_when_kill_switch_off() {
+        let mut p = Policy::default();
+        p.pauseCapture = true;
+        p.excludeApps = vec!["Safari".into()];
+        p.excludePatterns = vec!["*Banco*".into()];
+        p.excludeExePaths = vec!["com.apple.*".into()];
+        let pol = state(p);
+        assert_eq!(
+            drop_reason_with(&pol, "Safari", "Banco Secreto", Some("com.apple.Terminal")),
+            Some(DropReason::PauseCapture)
+        );
+    }
+
+    #[test]
+    fn excluded_app_exact_match() {
+        let mut p = Policy::default();
+        p.excludeApps = vec!["Safari".into()];
+        let pol = state(p);
+        assert_eq!(drop_reason_with(&pol, "Safari", "any title", None), Some(DropReason::ExcludedApp));
+    }
+
+    #[test]
+    fn excluded_app_non_match_is_none() {
+        let mut p = Policy::default();
+        p.excludeApps = vec!["Safari".into()];
+        let pol = state(p);
+        assert_eq!(drop_reason_with(&pol, "Chrome", "any title", None), None);
+    }
+
+    #[test]
+    fn excluded_pattern_glob_matches_title() {
+        let mut p = Policy::default();
+        p.excludePatterns = vec!["*Banco*".into()];
+        let pol = state(p);
+        assert_eq!(
+            drop_reason_with(&pol, "Chrome", "Banco Secreto - Cuenta", None),
+            Some(DropReason::ExcludedPattern)
+        );
+    }
+
+    #[test]
+    fn excluded_pattern_non_match_is_none() {
+        let mut p = Policy::default();
+        p.excludePatterns = vec!["*Banco*".into()];
+        let pol = state(p);
+        assert_eq!(drop_reason_with(&pol, "Chrome", "Reporte trimestral", None), None);
+    }
+
+    #[test]
+    fn excluded_pattern_is_case_sensitive_as_implemented() {
+        // globset::Glob is case-sensitive by default; drop_reason_with does not
+        // opt into case-insensitive matching, so a differently-cased title
+        // must NOT match. This documents current behavior, not a requirement.
+        let mut p = Policy::default();
+        p.excludePatterns = vec!["*Banco*".into()];
+        let pol = state(p);
+        assert_eq!(drop_reason_with(&pol, "Chrome", "banco secreto", None), None);
+    }
+
+    #[test]
+    fn excluded_exe_path_match_via_injected_identity() {
+        let mut p = Policy::default();
+        p.excludeExePaths = vec!["com.apple.*".into()];
+        let pol = state(p);
+        assert_eq!(
+            drop_reason_with(&pol, "Terminal", "any title", Some("com.apple.Terminal")),
+            Some(DropReason::ExcludedExePath)
+        );
+    }
+
+    #[test]
+    fn excluded_exe_path_non_match_is_none() {
+        let mut p = Policy::default();
+        p.excludeExePaths = vec!["com.apple.*".into()];
+        let pol = state(p);
+        assert_eq!(drop_reason_with(&pol, "Terminal", "any title", Some("com.other.App")), None);
+    }
+
+    #[test]
+    fn excluded_exe_path_without_identity_is_none() {
+        let mut p = Policy::default();
+        p.excludeExePaths = vec!["com.apple.*".into()];
+        let pol = state(p);
+        assert_eq!(drop_reason_with(&pol, "Terminal", "any title", None), None);
+    }
+
+    #[test]
+    fn excluded_app_precedes_pattern_and_exe_path() {
+        let mut p = Policy::default();
+        p.excludeApps = vec!["Safari".into()];
+        p.excludePatterns = vec!["*Banco*".into()];
+        p.excludeExePaths = vec!["com.apple.*".into()];
+        let pol = state(p);
+        assert_eq!(
+            drop_reason_with(&pol, "Safari", "Banco Secreto", Some("com.apple.Safari")),
+            Some(DropReason::ExcludedApp)
+        );
+    }
+
+    #[test]
+    fn excluded_pattern_precedes_exe_path() {
+        let mut p = Policy::default();
+        p.excludePatterns = vec!["*Banco*".into()];
+        p.excludeExePaths = vec!["com.apple.*".into()];
+        let pol = state(p);
+        assert_eq!(
+            drop_reason_with(&pol, "SomeOtherApp", "Banco Secreto", Some("com.apple.Terminal")),
+            Some(DropReason::ExcludedPattern)
+        );
+    }
+
+    #[test]
+    fn drop_reason_wrapper_matches_pure_fn_when_no_exe_paths_configured() {
+        // excludeExePaths empty => drop_reason() never touches front_exe_identity()
+        // (platform FFI), so the real entry point is directly testable here.
+        let mut p = Policy::default();
+        p.excludeApps = vec!["Safari".into()];
+        let pol = state(p);
+        assert_eq!(drop_reason(&pol, "Safari", "title"), Some(DropReason::ExcludedApp));
+        assert_eq!(drop_reason(&pol, "Chrome", "title"), None);
     }
 }
