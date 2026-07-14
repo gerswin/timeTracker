@@ -219,6 +219,11 @@ enum DropReason {
 }
 
 fn drop_reason(pol: &PolicyState, app: &str, title: &str) -> Option<DropReason> {
+    // Short-circuit killSwitch/pauseCapture BEFORE the frontmost-app FFI
+    // (front_exe_identity()): avoids one extra AX/window query per second on
+    // the hot kill/pause path when excludeExePaths is also configured.
+    if pol.policy.killSwitch { return Some(DropReason::KillSwitch); }
+    if pol.policy.pauseCapture { return Some(DropReason::PauseCapture); }
     let exe = if pol.policy.excludeExePaths.is_empty() { None } else { front_exe_identity() };
     drop_reason_with(pol, app, title, exe.as_deref())
 }

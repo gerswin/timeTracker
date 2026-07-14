@@ -272,12 +272,21 @@ async fn main() -> Result<()> {
         addr = DEFAULT_PANEL_ADDR
             .parse()
             .expect("DEFAULT_PANEL_ADDR es una dirección válida");
-    } else if allow_external_panel {
+    }
+    // El guard de Host solo debe omitirse cuando el bind EFECTIVO (tras el
+    // posible fallback anterior a DEFAULT_PANEL_ADDR) es realmente no-loopback.
+    // Si RIPOR_ALLOW_EXTERNAL_PANEL=1 pero el bind se quedó en loopback, no hay
+    // beneficio de exposición y desactivar el guard solo perdería la protección
+    // contra DNS-rebinding sin motivo.
+    let guard_disabled = allow_external_panel && !addr.ip().is_loopback();
+    if guard_disabled {
         tracing::info!(addr = %addr, "RIPOR_ALLOW_EXTERNAL_PANEL=1: guard de Host desactivado, bind externo permitido explícitamente");
+    } else if allow_external_panel {
+        tracing::info!(addr = %addr, "RIPOR_ALLOW_EXTERNAL_PANEL=1 ignorado: el bind sigue siendo loopback, el guard de Host permanece activo");
     }
     let bind_ip = addr.ip().to_string();
     let app = app.layer(axum::middleware::from_fn(move |req, next| {
-        panel_host_guard(bind_ip.clone(), allow_external_panel, req, next)
+        panel_host_guard(bind_ip.clone(), guard_disabled, req, next)
     }));
     info!("panel escuchando en http://{}", addr);
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -545,15 +554,17 @@ fn host_is_local(host: &str, bind_ip: &str) -> bool {
 /// Middleware: rechaza (403) peticiones cuya cabecera Host no sea loopback,
 /// mitigando ataques de DNS-rebinding / drive-by contra endpoints que mutan
 /// estado (p.ej. /policy/apply, /pause) aunque el panel esté en 127.0.0.1.
-/// Se omite por completo si el operador optó por exponer el panel
-/// externamente (RIPOR_ALLOW_EXTERNAL_PANEL=1).
+/// Se omite por completo cuando `guard_disabled` es true. La decisión de
+/// CUÁNDO ese bool debe ser true (RIPOR_ALLOW_EXTERNAL_PANEL=1 Y el bind
+/// efectivo es realmente no-loopback) vive en el wiring de main(), no aquí:
+/// esta función solo confía en el bool que recibe.
 async fn panel_host_guard(
     bind_ip: String,
-    allow_external: bool,
+    guard_disabled: bool,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if allow_external {
+    if guard_disabled {
         return next.run(req).await;
     }
     let ok = req
@@ -914,10 +925,10 @@ mod tests {
             "ok"
         }
         let bind_ip = "127.0.0.1".to_string();
-        let allow_external = false;
+        let guard_disabled = false;
         let app = Router::new().route("/x", get(ok)).layer(
             axum::middleware::from_fn(move |req, next| {
-                panel_host_guard(bind_ip.clone(), allow_external, req, next)
+                panel_host_guard(bind_ip.clone(), guard_disabled, req, next)
             }),
         );
 
@@ -946,17 +957,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panel_host_guard_se_omite_con_allow_external() {
+    async fn panel_host_guard_se_omite_con_guard_disabled() {
         use tower::ServiceExt;
 
         async fn ok() -> &'static str {
             "ok"
         }
         let bind_ip = "127.0.0.1".to_string();
-        let allow_external = true;
+        let guard_disabled = true;
         let app = Router::new().route("/x", get(ok)).layer(
             axum::middleware::from_fn(move |req, next| {
-                panel_host_guard(bind_ip.clone(), allow_external, req, next)
+                panel_host_guard(bind_ip.clone(), guard_disabled, req, next)
             }),
         );
 
@@ -967,5 +978,36 @@ mod tests {
             .unwrap();
         let resp_spoof = app.clone().oneshot(req_spoof).await.unwrap();
         assert_eq!(resp_spoof.status(), axum::http::StatusCode::OK);
+    }
+
+    // La decisión de CUÁNDO guard_disabled es true (bind no-loopback + flag)
+    // vive en el wiring de main(), no en panel_host_guard(): la función solo
+    // confía en el bool recibido. Este test fija ese contrato desde el lado
+    // "false": sin importar el origen del bool, un Host spoofeado sigue
+    // recibiendo 403 (caso ya cubierto arriba por
+    // panel_host_guard_permite_loopback_y_rechaza_spoof; se deja explícito
+    // aquí con el nombre del parámetro actualizado).
+    #[tokio::test]
+    async fn panel_host_guard_guard_disabled_false_rechaza_spoof() {
+        use tower::ServiceExt;
+
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let bind_ip = "127.0.0.1".to_string();
+        let guard_disabled = false;
+        let app = Router::new().route("/x", get(ok)).layer(
+            axum::middleware::from_fn(move |req, next| {
+                panel_host_guard(bind_ip.clone(), guard_disabled, req, next)
+            }),
+        );
+
+        let req_spoof = axum::http::Request::builder()
+            .uri("/x")
+            .header("Host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_spoof = app.clone().oneshot(req_spoof).await.unwrap();
+        assert_eq!(resp_spoof.status(), axum::http::StatusCode::FORBIDDEN);
     }
 }
