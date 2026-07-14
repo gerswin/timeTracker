@@ -44,6 +44,13 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 
 ---
 
+## Limitaciones conocidas (follow-ups priorizados, no bloqueantes)
+- [ ] **Head-of-line en fallo sistémico de descifrado**: si ≥5 filas al FRENTE de la cola son indescifrables (p.ej. `state.json` regenerado → nuevo `device_id` → AAD no coincide en filas viejas), el safety valve no las borra (correcto) pero el sender no alcanza las filas nuevas buenas detrás → entrega detenida hasta que la GC por edad (14 días) limpie el prefijo. Fix futuro: saltar el prefijo envenenado (`WHERE created_at > max(batch fallido)`) en vez de devolver vacío. Remedio manual hoy: borrar `queue.sqlite`.
+- [ ] **Modo degradado permanente**: si el keystore no está al arranque, el daemon queda sin cola hasta reiniciar (no re-intenta cargar la clave). Surface: `error!` al inicio + `queue_ok=false` + `queue_len=-1`. Recuperación = reinicio (hasta que exista el watchdog de Fase 6). Fix futuro: reintento acotado al arranque (p.ej. 3 intentos).
+- [ ] **GC no corre en modo degradado**: `gc()` no necesita la clave (SQL puro sobre `created_at`/`attempts`) pero está tras el gate de `Some(key)`, así que eventos cifrados previos sobreviven el tope de 14 días mientras está degradado. Relevante para privacidad. Fix: path de GC independiente de la clave.
+- [ ] **Heartbeat manda `queue_len=-1` en degradado**: si la API de ingest valida `queue_len >= 0`, rechazaría justo la señal de degradación. Confirmar tolerancia del backend o documentar el contrato.
+- [ ] `RIPOR_KEYSTORE_TIMEOUT_SECS` sin techo (un typo tipo 500000 retrasa el arranque días); `host_is_local` acepta basura tras prefijo loopback (falla cerrado); batería de tests `validate_api_base` del CLI es subconjunto de net.rs; objc dep bump (15 warnings restantes).
+
 ## Testing — deuda transversal (antes de nuevas features)
 - [ ] Harness de tests unitarios en workspace (hoy 0 tests). Unidades puras baratas primero:
   - [x] `FocusAgg` (consolidación, ráfagas sin huecos, switching rápido — 6 tests, cubre DoD Fase 3)
