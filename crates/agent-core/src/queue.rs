@@ -20,13 +20,6 @@ pub struct Queue {
     aad: Vec<u8>,
 }
 
-/// Tamaño mínimo de tanda a partir del cual "todas las filas fallaron al
-/// descifrar" se trata como fallo sistémico (AAD/clave incorrecta) en vez
-/// de N filas poison independientes. Por debajo de este umbral, una tanda
-/// totalmente mala sigue tratándose como corrupción genuina y se drena,
-/// para no estancar una cola chica para siempre.
-const SYSTEMIC_DECRYPT_MIN_BATCH: usize = 5;
-
 /// Configuración de recolección de basura (GC) para la cola de eventos.
 pub struct GcConfig {
     pub max_age_ms: u64,
@@ -51,11 +44,27 @@ fn init_schema(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at INTEGER NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
+            quarantined INTEGER NOT NULL DEFAULT 0,
             payload BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
         CREATE INDEX IF NOT EXISTS idx_events_attempts ON events(attempts);
         ",
+    )?;
+    // Migración: bases creadas antes de la columna `quarantined` la reciben
+    // aquí (ALTER falla si ya existe, así que se guarda con table_info).
+    let has_quarantined: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'quarantined'")?
+        .exists([])?;
+    if !has_quarantined {
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    // Índice del barrido caliente: filas entregables (quarantined=0) por edad.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_events_live ON events(quarantined, created_at);",
     )?;
     Ok(())
 }
@@ -112,17 +121,28 @@ impl Queue {
         Ok(out)
     }
 
-    /// Igual que `fetch_batch`, pero descifrado. Las filas que no se pueden
-    /// descifrar (poison rows) se descartan y se borran de inmediato en vez
-    /// de abortar todo el batch: nunca podrán enviarse, y dejarlas ahí
-    /// bloquearía el envío del resto de la cola para siempre.
+    /// Igual que `fetch_batch`, pero descifrado y saltando filas en cuarentena.
+    ///
+    /// Las filas que no descifran nunca se borran (borrar ante un error de
+    /// descifrado arriesga pérdida de datos si el fallo es transitorio, p.ej.
+    /// clave equivocada cargada un momento). En su lugar:
+    ///
+    /// - Si la tanda tiene alguna fila que sí descifra (o la fila más nueva de
+    ///   la cola descifra), la identidad (clave+AAD) está sana: las que fallan
+    ///   son poison permanente (p.ej. `device_id` cambió → AAD viejo) → se
+    ///   ponen en cuarentena para que dejen de bloquear a las buenas de atrás.
+    /// - Si TODA la vista actual es indescifrable y la fila más nueva también
+    ///   falla, puede ser una clave global equivocada → no se toca nada y se
+    ///   devuelve vacío: un reinicio con la clave correcta recupera todo.
+    ///
+    /// La GC por edad (`gc`) es la única vía que borra las filas en cuarentena.
     pub fn fetch_batch_decrypted(&self, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
         let mut out = Vec::new();
-        let mut poison_ids: Vec<i64> = Vec::new();
+        let mut failed_ids: Vec<i64> = Vec::new();
         {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, payload FROM events ORDER BY created_at ASC LIMIT ?1")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT id, payload FROM events WHERE quarantined = 0 ORDER BY created_at ASC LIMIT ?1",
+            )?;
             let rows = stmt.query_map([limit as i64], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?;
@@ -130,31 +150,70 @@ impl Queue {
                 let (id, blob) = r?;
                 match crate::crypto::decrypt_decompress(&self.key, &self.aad, &blob) {
                     Ok(plain) => out.push((id, plain)),
-                    Err(_) => poison_ids.push(id),
+                    Err(_) => failed_ids.push(id),
                 }
             }
         }
-        let total = out.len() + poison_ids.len();
-        if total >= SYSTEMIC_DECRYPT_MIN_BATCH && poison_ids.len() == total {
-            let now = now_ms();
-            let last = LAST_SYSTEMIC_LOG_MS.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= SYSTEMIC_LOG_THROTTLE_MS {
-                LAST_SYSTEMIC_LOG_MS.store(now, Ordering::Relaxed);
-                tracing::error!(
-                    total,
-                    "fallo sistémico de descifrado en la cola (¿AAD/clave incorrecta?); no se borra nada"
-                );
-            }
+        if failed_ids.is_empty() {
+            return Ok(out);
+        }
+        // Alguna fila descifró en esta tanda, o la más nueva sí lo hace: la
+        // identidad está sana, así que los fallos son poison genuino.
+        let key_healthy = !out.is_empty() || self.newest_live_row_decrypts()?;
+        if !key_healthy {
+            self.note_systemic_decrypt_failure(failed_ids.len());
             return Ok(Vec::new());
         }
-        if !poison_ids.is_empty() {
-            tracing::warn!(
-                count = poison_ids.len(),
-                "descartando filas indescifrables de la cola (poison rows)"
-            );
-            self.delete_ids(&poison_ids)?;
-        }
+        self.quarantine_ids(&failed_ids)?;
+        tracing::warn!(
+            count = failed_ids.len(),
+            "filas indescifrables puestas en cuarentena (no se borran; ¿device_id cambió?)"
+        );
         Ok(out)
+    }
+
+    /// ¿La fila más reciente no-cuarentenada descifra con la identidad actual?
+    /// Prueba barata para distinguir poison localizado (viejo) de una clave
+    /// global equivocada. `false` si no hay filas vivas.
+    fn newest_live_row_decrypts(&self) -> Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload FROM events WHERE quarantined = 0 ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        match rows.next() {
+            Some(r) => {
+                let blob = r?;
+                Ok(crate::crypto::decrypt_decompress(&self.key, &self.aad, &blob).is_ok())
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Marca filas como en cuarentena (no se vuelven a leer ni se borran salvo
+    /// por GC de edad).
+    fn quarantine_ids(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("UPDATE events SET quarantined = 1 WHERE id IN ({placeholders})");
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let n = self.conn.execute(&sql, params.as_slice())?;
+        Ok(n)
+    }
+
+    /// Log throttleado (1/min) del fallo sistémico de descifrado.
+    fn note_systemic_decrypt_failure(&self, total: usize) {
+        let now = now_ms();
+        let last = LAST_SYSTEMIC_LOG_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= SYSTEMIC_LOG_THROTTLE_MS {
+            LAST_SYSTEMIC_LOG_MS.store(now, Ordering::Relaxed);
+            tracing::error!(
+                total,
+                "fallo sistémico de descifrado en la cola (¿clave global incorrecta?); no se toca nada, esperando reinicio"
+            );
+        }
     }
 
     /// Marca un intento de envío fallido para estas filas.
@@ -365,30 +424,98 @@ mod tests {
         assert_eq!(remaining_ids, vec![ids[3], ids[4]]);
     }
 
-    #[test]
-    fn fetch_batch_decrypted_skips_and_deletes_poison_row() {
-        let (_d, paths) = tmp_paths();
-        let q = test_queue(&paths);
-        let good_id = q.enqueue_json(br#"{"ok":true}"#).unwrap();
+    fn state_dev(device: &str) -> AgentState {
+        AgentState {
+            device_id: device.to_string(),
+            agent_version: "0.0.0-test".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn queue_dev(paths: &Paths, key: [u8; 32], device: &str) -> Queue {
+        Queue::open_with_key(paths, &state_dev(device), key).unwrap()
+    }
+
+    fn insert_garbage(q: &Queue) {
         q.conn
             .execute(
                 "INSERT INTO events(created_at, attempts, payload) VALUES (?1, 0, ?2)",
                 params![now_ms() as i64, b"not encrypted garbage".to_vec()],
             )
             .unwrap();
+    }
+
+    fn count_quarantined(q: &Queue) -> i64 {
+        q.conn
+            .query_row("SELECT COUNT(1) FROM events WHERE quarantined = 1", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Con la clave sana (una fila de la tanda sí descifra), las filas
+    /// indescifrables se ponen en cuarentena — nunca se borran — y las buenas
+    /// se entregan igual.
+    #[test]
+    fn poison_row_quarantined_not_deleted_good_delivered() {
+        let (_d, paths) = tmp_paths();
+        let q = test_queue(&paths);
+        let good_id = q.enqueue_json(br#"{"ok":true}"#).unwrap();
+        insert_garbage(&q);
         assert_eq!(q.queue_len().unwrap(), 2);
+
         let batch = q.fetch_batch_decrypted(10).unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].0, good_id);
-        assert_eq!(q.queue_len().unwrap(), 1, "poison row must be deleted");
+        assert_eq!(q.queue_len().unwrap(), 2, "poison row must NOT be deleted");
+        assert_eq!(count_quarantined(&q), 1, "poison row must be quarantined");
     }
 
-    /// Fallo sistémico: si TODA una tanda de >= SYSTEMIC_DECRYPT_MIN_BATCH
-    /// filas falla al descifrar (ej. clave equivocada, AAD desincronizado),
-    /// no debe tratarse como N filas poison independientes: no se borra
-    /// nada y se devuelve vacío para que el operador lo note.
+    /// Prefijo envenenado más largo que la ventana de la tanda: mientras la
+    /// fila más nueva sí descifre (identidad sana), la cuarentena avanza tanda
+    /// a tanda hasta alcanzar las filas buenas de atrás. Nada se borra.
     #[test]
-    fn fetch_batch_decrypted_systemic_wrong_key_not_deleted() {
+    fn poison_prefix_quarantined_until_good_rows_reached() {
+        let (_d, paths) = tmp_paths();
+        // 6 filas viejas cifradas con device "dev-old".
+        let q_old = queue_dev(&paths, [7u8; 32], "dev-old");
+        let base = now_ms();
+        for i in 0..6u64 {
+            q_old
+                .enqueue_json_at(format!(r#"{{"old":{i}}}"#).as_bytes(), base + i)
+                .unwrap();
+        }
+        // Cambia el device (AAD): las 6 viejas ahora son indescifrables.
+        // 3 filas buenas nuevas bajo el device nuevo.
+        let q_new = queue_dev(&paths, [7u8; 32], "dev-new");
+        for i in 0..3u64 {
+            q_new
+                .enqueue_json_at(format!(r#"{{"new":{i}}}"#).as_bytes(), base + 100 + i)
+                .unwrap();
+        }
+        assert_eq!(q_new.queue_len().unwrap(), 9);
+
+        // Tanda de 3: primeras tandas son 100% poison → se ponen en cuarentena
+        // y devuelven vacío; eventualmente aparecen las 3 buenas.
+        let mut delivered: Vec<(i64, Vec<u8>)> = Vec::new();
+        for _ in 0..5 {
+            let batch = q_new.fetch_batch_decrypted(3).unwrap();
+            if !batch.is_empty() {
+                delivered = batch;
+                break;
+            }
+        }
+        assert_eq!(delivered.len(), 3, "las 3 buenas deben entregarse");
+        assert!(delivered.iter().all(|(_, p)| p.starts_with(b"{\"new\":")));
+        assert_eq!(count_quarantined(&q_new), 6, "las 6 viejas en cuarentena");
+        assert_eq!(q_new.queue_len().unwrap(), 9, "nada se borra");
+    }
+
+    /// Fallo sistémico global: TODA la cola es indescifrable y la fila más
+    /// nueva también falla → puede ser una clave equivocada transitoria. No se
+    /// pone nada en cuarentena ni se borra: se bloquea la entrega y se espera
+    /// un reinicio con la clave correcta, que recupera todo.
+    #[test]
+    fn systemic_wrong_key_blocks_and_preserves_everything() {
         let (_d, paths) = tmp_paths();
         let q = test_queue(&paths); // key = [7u8; 32]
         for i in 0..5 {
@@ -396,36 +523,31 @@ mod tests {
         }
         assert_eq!(q.queue_len().unwrap(), 5);
 
-        // Reabrir la misma cola con una clave distinta: cada fila falla la
-        // autenticación AEAD, como pasaría con una clave incorrecta en disco.
+        // Reabrir con clave distinta: cada fila falla la autenticación AEAD.
         let q2 = Queue::open_with_key(&paths, &test_state(), [9u8; 32]).unwrap();
         let batch = q2.fetch_batch_decrypted(10).unwrap();
         assert!(batch.is_empty(), "systemic failure must not return rows");
-        assert_eq!(
-            q2.queue_len().unwrap(),
-            5,
-            "systemic failure must not delete any row"
-        );
+        assert_eq!(q2.queue_len().unwrap(), 5, "must not delete any row");
+        assert_eq!(count_quarantined(&q2), 0, "must not quarantine on wrong key");
+
+        // Reinicio con la clave correcta: todo se recupera.
+        let q3 = Queue::open_with_key(&paths, &test_state(), [7u8; 32]).unwrap();
+        let recovered = q3.fetch_batch_decrypted(10).unwrap();
+        assert_eq!(recovered.len(), 5, "correct key recovers all rows");
     }
 
-    /// Poison parcial: si solo algunas filas de la tanda son indescifrables,
-    /// se siguen borrando solo esas (comportamiento previo intacto).
+    /// Poison parcial: algunas filas indescifrables junto a buenas → las buenas
+    /// se entregan, las malas se ponen en cuarentena (no se borran).
     #[test]
-    fn fetch_batch_decrypted_partial_poison_drains_only_bad_rows() {
+    fn partial_poison_quarantines_bad_keeps_good() {
         let (_d, paths) = tmp_paths();
         let q = test_queue(&paths);
         let mut good_ids: Vec<i64> = Vec::new();
         for i in 0..3 {
             good_ids.push(q.enqueue_json(format!(r#"{{"i":{i}}}"#).as_bytes()).unwrap());
         }
-        for _ in 0..2 {
-            q.conn
-                .execute(
-                    "INSERT INTO events(created_at, attempts, payload) VALUES (?1, 0, ?2)",
-                    params![now_ms() as i64, b"not encrypted garbage".to_vec()],
-                )
-                .unwrap();
-        }
+        insert_garbage(&q);
+        insert_garbage(&q);
         assert_eq!(q.queue_len().unwrap(), 5);
 
         let batch = q.fetch_batch_decrypted(10).unwrap();
@@ -434,36 +556,92 @@ mod tests {
         let mut expected = good_ids.clone();
         expected.sort();
         assert_eq!(ids, expected, "partial poison must keep only good rows");
-        assert_eq!(
-            q.queue_len().unwrap(),
-            3,
-            "only the garbage rows should be deleted"
-        );
+        assert_eq!(q.queue_len().unwrap(), 5, "garbage rows must NOT be deleted");
+        assert_eq!(count_quarantined(&q), 2, "garbage rows must be quarantined");
     }
 
-    /// Tanda pequeña totalmente mala (< SYSTEMIC_DECRYPT_MIN_BATCH): sigue
-    /// tratándose como poison genuino y se drena, para no estancar una cola
-    /// chica en corrupción real de 1-4 filas.
+    /// Cola totalmente mala sin ninguna fila buena (ni la más nueva descifra):
+    /// se trata como fallo sistémico → se bloquea, no se borra ni pone en
+    /// cuarentena. La GC por edad la limpiará a los 14 días.
     #[test]
-    fn fetch_batch_decrypted_small_all_bad_batch_is_drained() {
+    fn all_bad_no_good_row_blocks_without_delete() {
         let (_d, paths) = tmp_paths();
         let q = test_queue(&paths);
         for _ in 0..3 {
-            q.conn
-                .execute(
-                    "INSERT INTO events(created_at, attempts, payload) VALUES (?1, 0, ?2)",
-                    params![now_ms() as i64, b"not encrypted garbage".to_vec()],
-                )
-                .unwrap();
+            insert_garbage(&q);
         }
         assert_eq!(q.queue_len().unwrap(), 3);
 
         let batch = q.fetch_batch_decrypted(10).unwrap();
         assert!(batch.is_empty());
-        assert_eq!(
-            q.queue_len().unwrap(),
-            0,
-            "small all-bad batch should still be drained"
-        );
+        assert_eq!(q.queue_len().unwrap(), 3, "all-bad batch must NOT be deleted");
+        assert_eq!(count_quarantined(&q), 0, "nothing quarantined when key looks unhealthy");
+    }
+
+    /// Las filas en cuarentena no vuelven a aparecer en fetch posteriores.
+    #[test]
+    fn quarantined_rows_excluded_from_future_fetch() {
+        let (_d, paths) = tmp_paths();
+        let q = test_queue(&paths);
+        let good_id = q.enqueue_json(br#"{"ok":1}"#).unwrap();
+        insert_garbage(&q);
+
+        let first = q.fetch_batch_decrypted(10).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(count_quarantined(&q), 1);
+
+        // Entrega la buena; solo queda la fila en cuarentena.
+        q.delete_ids(&[good_id]).unwrap();
+        let second = q.fetch_batch_decrypted(10).unwrap();
+        assert!(second.is_empty(), "quarantined row must not be re-fetched");
+    }
+
+    /// La GC por edad borra filas en cuarentena igual que cualquier otra
+    /// (opera sobre created_at, sin descifrar).
+    #[test]
+    fn gc_prunes_quarantined_by_age() {
+        let (_d, paths) = tmp_paths();
+        let q = test_queue(&paths);
+        insert_garbage(&q); // created_at = now (reciente)
+        // Envejece la fila y ponla en cuarentena.
+        q.conn
+            .execute(
+                "UPDATE events SET created_at = ?1, quarantined = 1",
+                params![now_ms().saturating_sub(100_000) as i64],
+            )
+            .unwrap();
+        let stats = q
+            .gc(&GcConfig { max_age_ms: 50_000, max_rows: 1_000_000, max_attempts: 1000 })
+            .unwrap();
+        assert_eq!(stats.pruned_age, 1, "quarantined row aged out by GC");
+        assert_eq!(q.queue_len().unwrap(), 0);
+    }
+
+    /// Una base creada antes de la columna `quarantined` recibe la columna al
+    /// abrir (migración) y la cuarentena funciona sobre ella.
+    #[test]
+    fn legacy_db_without_quarantined_column_migrates() {
+        let (_d, paths) = tmp_paths();
+        // Esquema viejo: sin columna `quarantined`.
+        {
+            let conn = Connection::open(paths.queue_db()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    payload BLOB NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+        // Abrir vía Queue → migración añade la columna.
+        let q = test_queue(&paths);
+        let good_id = q.enqueue_json(br#"{"ok":1}"#).unwrap();
+        insert_garbage(&q);
+        let batch = q.fetch_batch_decrypted(10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, good_id);
+        assert_eq!(count_quarantined(&q), 1, "migración + cuarentena funcionan");
     }
 }
