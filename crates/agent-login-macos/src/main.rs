@@ -1,11 +1,12 @@
-#![cfg(target_os = "macos")]
 #![allow(non_snake_case)]
 
-use cocoa::appkit::{NSApp, NSApplication};
-use cocoa::base::{id, nil};
-use cocoa::foundation::NSAutoreleasePool;
-
+#[cfg(target_os = "macos")]
 fn main() {
+    use cocoa::appkit::NSApp;
+    use cocoa::base::nil;
+    use cocoa::foundation::NSAutoreleasePool;
+    use objc::*;
+
     unsafe {
         let _pool = NSAutoreleasePool::new(nil);
         // Attempt to run bundled agent-daemon: ../Resources/bin/agent-daemon
@@ -22,7 +23,11 @@ fn main() {
         }
         // Exit quickly; Login Item can be keep-alive by system if needed
         let app = NSApp();
-        let _: () = msg_send::msg_send![app, terminate: nil];
+        let _: () = msg_send![app, terminate: nil];
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("agent-login-macos solo corre en macOS");
+}
