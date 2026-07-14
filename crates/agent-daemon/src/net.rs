@@ -22,6 +22,25 @@ struct HeartbeatPayload<'a> {
     mem_mb: u64,
 }
 
+fn heartbeat_body(
+    device_id: &str,
+    agent_version: &str,
+    last_event_ts: u64,
+    queue_len: i64,
+    cpu_pct: f32,
+    mem_mb: u64,
+) -> String {
+    serde_json::to_string(&HeartbeatPayload {
+        device_id,
+        agent_version,
+        last_event_ts,
+        queue_len,
+        cpu_pct,
+        mem_mb,
+    })
+    .expect("serializa heartbeat")
+}
+
 pub async fn run_heartbeat_loop(
     state: Arc<AgentState>,
     paths: &Paths,
@@ -35,36 +54,33 @@ pub async fn run_heartbeat_loop(
     loop {
         sleep(Duration::from_secs(60)).await;
         let last_evt = last_event_ts.load(Ordering::Relaxed);
-        if last_evt != 0 && now_ms().saturating_sub(last_evt) < 60_000 {
-            continue; // hubo eventos recientes; sin heartbeat
-        }
         let queue_len = match agent_core::queue::Queue::open(paths, &state) {
             Ok(q) => q.queue_len().unwrap_or(0),
             Err(_) => 0,
         };
-        let _m = metrics.get();
+        let m = metrics.get();
         if let Some(base) = api_base.as_deref() {
             if let Some(secrets) = AgentSecrets::load(paths).ok().flatten() {
-                let body = serde_json::json!({
-                    "status": "running",
-                    "uptime_seconds": 0,
-                    "last_activity_ms": last_evt,
-                    "agent_version": state.agent_version,
-                });
-                let body_str = serde_json::to_string(&body).unwrap();
+                let body_str = heartbeat_body(
+                    secrets.device_id.as_deref().unwrap_or(&state.device_id),
+                    &state.agent_version,
+                    last_evt,
+                    queue_len,
+                    m.cpu_pct,
+                    m.mem_mb,
+                );
                 let sig = hmac_hex(&secrets.server_salt, body_str.as_bytes());
                 let url = format!("{}/v1/agents/heartbeat", base.trim_end_matches('/'));
                 if std::env::var("RIPOR_DEBUG_INGEST").ok().as_deref() == Some("1") {
                     debug!(payload=%body_str, url=%url, "heartbeat payload");
                 }
-                let mut sent = false;
                 match client.post(url.clone())
                     .header("Content-Type", "application/json")
                     .header("Agent-Token", secrets.agent_token.clone())
                     .header("X-Body-HMAC", sig.clone())
                     .body(body_str.clone())
                     .send().await {
-                    Ok(resp) if resp.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); sent = true; }
+                    Ok(resp) if resp.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); }
                     Ok(resp) if resp.status().as_u16() == 401 => {
                         if let Some(newsec) = rebootstrap(paths, &state).await {
                             let sig2 = hmac_hex(&newsec.server_salt, body_str.as_bytes());
@@ -74,7 +90,7 @@ pub async fn run_heartbeat_loop(
                                 .header("X-Body-HMAC", sig2)
                                 .body(body_str)
                                 .send().await {
-                                Ok(r2) if r2.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); sent = true; }
+                                Ok(r2) if r2.status().is_success() => { last_heartbeat_ts.store(now_ms(), Ordering::Relaxed); }
                                 Ok(r2) => warn!(status=?r2.status(), "heartbeat tras re-bootstrap falló"),
                                 Err(e2) => warn!(?e2, "heartbeat error red tras re-bootstrap"),
                             }
@@ -185,7 +201,11 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
         let sig = hmac_hex(&secrets.server_salt, body_str.as_bytes());
         let url = format!("{}/v1/events:ingest", api_base.trim_end_matches('/'));
         if std::env::var("RIPOR_DEBUG_INGEST").ok().as_deref() == Some("1") {
-            debug!(payload=%body_str, url=%url, count=%events_json.len(), "ingest payload");
+            if std::env::var("RIPOR_DEBUG").ok().as_deref() == Some("1") {
+                debug!(payload=%body_str, url=%url, count=%events_json.len(), "ingest payload");
+            } else {
+                debug!(url=%url, count=%events_json.len(), "ingest payload (body omitido; títulos completos solo con RIPOR_DEBUG=1)");
+            }
         }
         let mut ok_sent = false;
         match client.post(url.clone())
@@ -333,6 +353,41 @@ async fn rebootstrap(paths: &Paths, state: &AgentState) -> Option<AgentSecrets> 
     }
 }
 
+fn poll_secs_from(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(10)
+}
+
+fn policy_poll_secs() -> u64 {
+    poll_secs_from(std::env::var("POLICY_POLL_SECS").ok().as_deref())
+}
+
+async fn apply_policy_response(resp: reqwest::Response, paths: &Paths, rt: &PolicyRuntime) {
+    let hdr = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => {
+            let polv = v.get("policy").cloned().unwrap_or(v);
+            match serde_json::from_value::<crate::policy::Policy>(polv) {
+                Ok(policy) => {
+                    let st = PolicyState { policy, etag: hdr };
+                    if let Err(e) = save_policy(paths, &st) {
+                        warn!(?e, "no se pudo guardar policy");
+                    }
+                    rt.set(st);
+                    info!("policy actualizada");
+                }
+                Err(e) => warn!(?e, "parse policy fallo"),
+            }
+        }
+        Err(e) => warn!(?e, "parse json en policy fallo"),
+    }
+}
+
 pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
     // load initial from disk
     let initial = load_policy(paths);
@@ -350,23 +405,7 @@ pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
         match req.send().await {
             Ok(resp) if resp.status().as_u16() == 304 => { /* unchanged */ }
             Ok(resp) if resp.status().is_success() => {
-                let hdr = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-                match resp.json::<serde_json::Value>().await {
-                    Ok(v) => {
-                        // soporta respuesta con campo policy o directamente la policy rica
-                        let polv = v.get("policy").cloned().unwrap_or(v);
-                        match serde_json::from_value::<crate::policy::Policy>(polv) {
-                            Ok(policy) => {
-                                let st = PolicyState { policy, etag: hdr };
-                                if let Err(e) = save_policy(paths, &st) { warn!(?e, "no se pudo guardar policy"); }
-                                rt.set(st);
-                                info!("policy actualizada");
-                            }
-                            Err(e) => warn!(?e, "parse policy fallo"),
-                        }
-                    }
-                    Err(e) => warn!(?e, "parse json en policy fallo"),
-                }
+                apply_policy_response(resp, paths, &rt).await;
             }
             Ok(resp) if resp.status().as_u16() == 401 => {
                 // try rebootstrap then retry once
@@ -374,13 +413,20 @@ pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
                     let url2 = format!("{}/v1/policy/{}", base.trim_end_matches('/'), urlencoding::encode(&user));
                     let mut r2 = client.get(url2).header("Agent-Token", ns.agent_token);
                     if let Some(tag) = etag.as_deref() { r2 = r2.header("If-None-Match", tag); }
-                    let _ = r2.send().await; // siguiente ciclo parseará
+                    match r2.send().await {
+                        Ok(r2resp) if r2resp.status().as_u16() == 304 => { /* sin cambios */ }
+                        Ok(r2resp) if r2resp.status().is_success() => {
+                            apply_policy_response(r2resp, paths, &rt).await;
+                        }
+                        Ok(r2resp) => warn!(status=?r2resp.status(), "policy tras re-bootstrap falló"),
+                        Err(e2) => warn!(?e2, "policy error red tras re-bootstrap"),
+                    }
                 }
             }
             Ok(resp) => warn!(status=?resp.status(), "policy fallo"),
             Err(e) => warn!(?e, "policy error red"),
         }
-        sleep(Duration::from_secs(300)).await;
+        sleep(Duration::from_secs(policy_poll_secs())).await;
     }
 }
 
@@ -406,5 +452,37 @@ pub async fn fetch_policy_once(paths: &Paths, rt: std::sync::Arc<PolicyRuntime>)
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_body_incluye_device_id() {
+        let body = heartbeat_body("dev-123", "0.1.0", 42, 7, 1.5, 20);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["device_id"], "dev-123");
+        assert_eq!(v["agent_version"], "0.1.0");
+        assert_eq!(v["last_event_ts"], 42);
+        assert_eq!(v["queue_len"], 7);
+        assert_eq!(v["mem_mb"], 20);
+    }
+
+    #[test]
+    fn poll_secs_default_es_10() {
+        assert_eq!(poll_secs_from(None), 10);
+    }
+
+    #[test]
+    fn poll_secs_lee_valor_valido() {
+        assert_eq!(poll_secs_from(Some("60")), 60);
+    }
+
+    #[test]
+    fn poll_secs_rechaza_invalidos() {
+        assert_eq!(poll_secs_from(Some("abc")), 10);
+        assert_eq!(poll_secs_from(Some("0")), 10);
     }
 }

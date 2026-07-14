@@ -1,30 +1,11 @@
-use crate::paths::{ensure_parent, Paths};
+pub use crate::keystore::load_or_create_key;
 use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
 use anyhow::{anyhow, Result};
 use rand::RngCore;
-use std::fs;
 
 const KEY_LEN: usize = 32; // AES-256-GCM
 const NONCE_LEN: usize = 12; // 96-bit nonce
 const MAGIC: &[u8] = b"EV1"; // formato cifrado versión 1
-
-pub fn load_or_create_key(paths: &Paths) -> Result<[u8; KEY_LEN]> {
-    let key_path = paths.key_file();
-    if key_path.exists() {
-        let data = fs::read(&key_path)?;
-        if data.len() != KEY_LEN {
-            return Err(anyhow!("tamaño de clave inválido"));
-        }
-        let mut k = [0u8; KEY_LEN];
-        k.copy_from_slice(&data);
-        return Ok(k);
-    }
-    let mut k = [0u8; KEY_LEN];
-    rand::thread_rng().fill_bytes(&mut k);
-    ensure_parent(&key_path)?;
-    fs::write(&key_path, &k)?;
-    Ok(k)
-}
 
 pub fn encrypt_compress(key: &[u8; KEY_LEN], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow!("clave AES inválida"))?;
@@ -55,4 +36,26 @@ pub fn decrypt_decompress(key: &[u8; KEY_LEN], aad: &[u8], blob: &[u8]) -> Resul
         .map_err(|_| anyhow!("falló descifrado"))?;
     let decompressed = zstd::decode_all(&compressed[..])?;
     Ok(decompressed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_cifrar_descifrar() {
+        let key = [7u8; 32];
+        let aad = b"device-1";
+        let plain = br#"{"hola":true}"#;
+        let blob = encrypt_compress(&key, aad, plain).unwrap();
+        let out = decrypt_decompress(&key, aad, &blob).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn descifrar_falla_con_aad_distinto() {
+        let key = [7u8; 32];
+        let blob = encrypt_compress(&key, b"a", b"x").unwrap();
+        assert!(decrypt_decompress(&key, b"b", &blob).is_err());
+    }
 }

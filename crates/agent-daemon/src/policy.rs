@@ -101,3 +101,46 @@ impl DropLog {
         q.iter().rev().take(take).cloned().collect()
     }
 }
+
+pub fn redact_title(title: &str) -> String {
+    let debug = std::env::var("RIPOR_DEBUG").ok().as_deref() == Some("1");
+    redact_title_with(debug, title)
+}
+
+pub fn redact_title_with(debug: bool, title: &str) -> String {
+    if debug || title.is_empty() {
+        return title.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(title.as_bytes());
+    format!("[title:{}]", hex::encode(&h[..4]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_oculta_titulo_sin_debug() {
+        let out = redact_title_with(false, "Banco Secreto - Cuenta 1234");
+        assert!(!out.contains("Banco"));
+        assert!(out.starts_with("[title:"));
+        assert!(out.ends_with(']'));
+    }
+
+    #[test]
+    fn redact_passthrough_con_debug() {
+        assert_eq!(redact_title_with(true, "hola mundo"), "hola mundo");
+    }
+
+    #[test]
+    fn redact_es_determinista() {
+        assert_eq!(redact_title_with(false, "x"), redact_title_with(false, "x"));
+        assert_ne!(redact_title_with(false, "x"), redact_title_with(false, "y"));
+    }
+
+    #[test]
+    fn redact_vacio_queda_vacio() {
+        assert_eq!(redact_title_with(false, ""), "");
+    }
+}
