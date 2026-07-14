@@ -1,24 +1,33 @@
-#![cfg(target_os = "windows")]
-
+#[cfg(target_os = "windows")]
 use std::thread;
+#[cfg(target_os = "windows")]
 use std::time::Duration;
+#[cfg(target_os = "windows")]
 use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem, MenuEvent}};
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::Shell::ShellExecuteW;
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{HWND, HINSTANCE, PWSTR};
+#[cfg(target_os = "windows")]
 use winreg::enums::*;
+#[cfg(target_os = "windows")]
 use winreg::RegKey;
 
+#[cfg(target_os = "windows")]
 fn open_url(url: &str) {
     let wurl: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { let _ = ShellExecuteW(HWND(0), PWSTR("open\0".encode_utf16().collect::<Vec<u16>>().as_ptr() as *mut _), PWSTR(wurl.as_ptr() as *mut _), PWSTR(std::ptr::null_mut()), PWSTR(std::ptr::null_mut()), 1); }
 }
 
+#[cfg(target_os = "windows")]
 fn api_base() -> String {
     std::env::var("PANEL_ADDR").map(|a| format!("http://{}", a)).unwrap_or_else(|_| "http://127.0.0.1:49219".to_string())
 }
 
+#[cfg(target_os = "windows")]
 fn http_get(path: &str) { let base = api_base(); let url = format!("{}{}", base, path); thread::spawn(move || { let _ = reqwest::blocking::get(&url); }); }
 
+#[cfg(target_os = "windows")]
 fn autorun_enabled() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok(key) = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
@@ -27,6 +36,7 @@ fn autorun_enabled() -> bool {
     false
 }
 
+#[cfg(target_os = "windows")]
 fn set_autorun(enable: bool) {
     let exe = std::env::current_exe().unwrap_or_default();
     let mut exe_dir = exe.clone();
@@ -39,6 +49,7 @@ fn set_autorun(enable: bool) {
     else { let _ = key.delete_value("RiporAgent"); }
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     // Build menu
     let mut menu = Menu::new();
@@ -89,6 +100,7 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn load_tray_icon() -> Option<tray_icon::Icon> {
     // Prefer embedded bytes at compile time
     let data: Option<&'static [u8]> = option_env!("RIPOR_NO_EMBED_ICON").map(|_| None).unwrap_or_else(|| {
@@ -113,6 +125,7 @@ fn load_tray_icon() -> Option<tray_icon::Icon> {
     tray_icon::Icon::from_rgba(rgba, 32, 32).ok()
 }
 
+#[cfg(target_os = "windows")]
 fn decode_ico(bytes: &[u8]) -> Result<tray_icon::Icon, ()> {
     let mut cursor = std::io::Cursor::new(bytes);
     let ico = ico::IconDir::read(&mut cursor).map_err(|_| ())?;
@@ -125,4 +138,9 @@ fn decode_ico(bytes: &[u8]) -> Result<tray_icon::Icon, ()> {
     };
     let w = entry.width() as u32; let h = entry.height() as u32;
     tray_icon::Icon::from_rgba(rgba, w, h).map_err(|_| ())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!("agent-ui-windows solo corre en Windows");
 }
