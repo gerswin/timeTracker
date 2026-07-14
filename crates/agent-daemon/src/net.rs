@@ -51,11 +51,27 @@ pub async fn run_heartbeat_loop(
     info!("iniciando loop de heartbeat (Fase 1)");
     let client = Client::builder().build().expect("client http");
     let api_base = std::env::var("API_BASE_URL").ok();
+    let gc_cfg = gc_config_from_env();
     loop {
         sleep(Duration::from_secs(60)).await;
         let last_evt = last_event_ts.load(Ordering::Relaxed);
         let queue_len = match agent_core::queue::Queue::open(paths, &state) {
-            Ok(q) => q.queue_len().unwrap_or(0),
+            Ok(q) => {
+                match q.gc(&gc_cfg) {
+                    Ok(stats) => {
+                        if stats.pruned_age > 0 || stats.pruned_attempts > 0 || stats.pruned_overflow > 0 {
+                            info!(
+                                pruned_age = stats.pruned_age,
+                                pruned_attempts = stats.pruned_attempts,
+                                pruned_overflow = stats.pruned_overflow,
+                                "gc de cola: filas eliminadas"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(?e, "gc de cola falló"),
+                }
+                q.queue_len().unwrap_or(0)
+            }
             Err(_) => 0,
         };
         let m = metrics.get();
@@ -207,6 +223,7 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
                 debug!(url=%url, count=%events_json.len(), "ingest payload (body omitido; títulos completos solo con RIPOR_DEBUG=1)");
             }
         }
+        let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
         let mut ok_sent = false;
         match client.post(url.clone())
             .header("Content-Type", "application/json")
@@ -215,7 +232,6 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
             .body(body_str.clone())
             .send().await {
             Ok(resp) if resp.status().is_success() => {
-                let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
                 if let Ok(count) = q.delete_ids(&ids) {
                     info!(count, "eventos enviados y eliminados de la cola");
                 }
@@ -232,18 +248,39 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
                         .body(body_str)
                         .send().await {
                         Ok(r2) if r2.status().is_success() => {
-                            let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
                             if let Ok(count) = q.delete_ids(&ids) { info!(count, "eventos enviados tras re-bootstrap y eliminados"); }
                             backoff = 1; ok_sent = true;
                         }
-                        Ok(r2) => warn!(status=?r2.status(), "ingest tras re-bootstrap falló"),
-                        Err(e2) => warn!(?e2, "ingest error red tras re-bootstrap"),
+                        Ok(r2) => {
+                            warn!(status=?r2.status(), "ingest tras re-bootstrap falló");
+                            sleep(Duration::from_secs(backoff)).await;
+                            backoff = (backoff * 2).min(60);
+                        }
+                        Err(e2) => {
+                            warn!(?e2, "ingest error red tras re-bootstrap");
+                            sleep(Duration::from_secs(backoff)).await;
+                            backoff = (backoff * 2).min(60);
+                        }
                     }
-                } else { warn!("re-bootstrap no disponible"); }
+                } else {
+                    warn!("re-bootstrap no disponible");
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
+                }
             }
             Ok(resp) if resp.status().as_u16() == 403 => {
                 warn!(status=?resp.status(), "ingest forbidden (403)");
                 sleep(Duration::from_secs(backoff)).await; backoff = (backoff*2).min(60);
+            }
+            Ok(resp) if is_payload_rejection(resp.status().as_u16()) => {
+                // El servidor rechaza el payload en sí: reintentar es inútil.
+                // Solo aquí se cuenta el intento, para que el GC por attempts
+                // pode el batch venenoso; los fallos de red/auth/servidor
+                // reintentan sin límite (el tope offline es el GC por edad).
+                warn!(status=?resp.status(), "ingest rechazó el payload; se incrementa attempts");
+                if let Err(ie) = q.increment_attempts(&ids) { warn!(?ie, "no se pudo incrementar attempts"); }
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
             }
             Ok(resp) => {
                 warn!(status=?resp.status(), "envío de eventos falló");
@@ -357,6 +394,44 @@ fn poll_secs_from(v: Option<&str>) -> u64 {
     v.and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(10)
+}
+
+fn gc_config_from(
+    age_days: Option<&str>,
+    rows: Option<&str>,
+    attempts: Option<&str>,
+) -> agent_core::queue::GcConfig {
+    let max_age_days = age_days
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(14);
+    let max_rows = rows
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(100_000);
+    let max_attempts = attempts
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(50);
+    agent_core::queue::GcConfig {
+        max_age_ms: max_age_days * 24 * 60 * 60 * 1000,
+        max_rows,
+        max_attempts,
+    }
+}
+
+/// Estados HTTP que indican que el servidor rechaza el payload en sí
+/// (reintentar el mismo batch es inútil). Solo estos cuentan attempts.
+fn is_payload_rejection(status: u16) -> bool {
+    matches!(status, 400 | 413 | 422)
+}
+
+fn gc_config_from_env() -> agent_core::queue::GcConfig {
+    gc_config_from(
+        std::env::var("QUEUE_MAX_AGE_DAYS").ok().as_deref(),
+        std::env::var("QUEUE_MAX_ROWS").ok().as_deref(),
+        std::env::var("QUEUE_MAX_ATTEMPTS").ok().as_deref(),
+    )
 }
 
 fn policy_poll_secs() -> u64 {
@@ -484,5 +559,42 @@ mod tests {
     fn poll_secs_rechaza_invalidos() {
         assert_eq!(poll_secs_from(Some("abc")), 10);
         assert_eq!(poll_secs_from(Some("0")), 10);
+    }
+
+    #[test]
+    fn gc_config_from_defaults() {
+        let cfg = gc_config_from(None, None, None);
+        assert_eq!(cfg.max_age_ms, 14 * 24 * 60 * 60 * 1000);
+        assert_eq!(cfg.max_rows, 100_000);
+        assert_eq!(cfg.max_attempts, 50);
+    }
+
+    #[test]
+    fn gc_config_from_lee_valores_validos() {
+        let cfg = gc_config_from(Some("7"), Some("500"), Some("10"));
+        assert_eq!(cfg.max_age_ms, 7 * 24 * 60 * 60 * 1000);
+        assert_eq!(cfg.max_rows, 500);
+        assert_eq!(cfg.max_attempts, 10);
+    }
+
+    #[test]
+    fn gc_config_from_rechaza_invalidos() {
+        let cfg = gc_config_from(Some("abc"), Some("0"), Some("-1"));
+        assert_eq!(cfg.max_age_ms, 14 * 24 * 60 * 60 * 1000);
+        assert_eq!(cfg.max_rows, 100_000);
+        assert_eq!(cfg.max_attempts, 50);
+    }
+
+    #[test]
+    fn payload_rejection_solo_400_413_422() {
+        assert!(is_payload_rejection(400));
+        assert!(is_payload_rejection(413));
+        assert!(is_payload_rejection(422));
+        // transporte/auth/servidor: reintentar es correcto, no cuentan attempts
+        assert!(!is_payload_rejection(401));
+        assert!(!is_payload_rejection(403));
+        assert!(!is_payload_rejection(429));
+        assert!(!is_payload_rejection(500));
+        assert!(!is_payload_rejection(503));
     }
 }

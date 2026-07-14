@@ -3,11 +3,11 @@ name = "agent-login-macos"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.25"
 objc = "0.2"
 
-[bin]
+[[bin]]
 name = "agent-login-macos"
 path = "src/main.rs"
 

@@ -5,3 +5,10 @@
 /.vscode/
 Cargo.lock
 .env
+
+# Artefactos de build/packaging — publicar por releases, no en git
+/dist/
+.DS_Store
+
+# Scratch de sesiones (superpowers SDD)
+/.superpowers/

@@ -4,6 +4,7 @@ members = [
   "crates/agent-daemon",
   "crates/agent-ui-macos",
   "crates/agent-ui-windows",
+  "crates/agent-login-macos",
   "crates/agent-cli"
 ]
 resolver = "2"

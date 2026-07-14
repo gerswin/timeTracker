@@ -204,7 +204,17 @@ fn should_force_emit(last_ts: u64) -> bool {
 }
 
 #[derive(Copy, Clone)]
-enum DropReason { KillSwitch, PauseCapture, ExcludedApp, ExcludedPattern, Throttled }
+enum DropReason {
+    KillSwitch,
+    PauseCapture,
+    ExcludedApp,
+    ExcludedPattern,
+    // Never constructed by drop_reason(): the throttle-drop path below logs
+    // "throttled" directly without going through this enum. Kept (not
+    // deleted) since the match arms below already handle it exhaustively.
+    #[allow(dead_code)]
+    Throttled,
+}
 
 fn drop_reason(pol: &PolicyState, app: &str, title: &str) -> Option<DropReason> {
     let p = &pol.policy;
@@ -957,6 +967,10 @@ fn ax_focused_app() -> Option<(i32, String)> {
     struct __AXUIElement;
     type AXUIElementRef = *mut __AXUIElement;
     #[link(name = "ApplicationServices", kind = "framework")]
+    // __AXUIElement is a deliberately-opaque field-less FFI marker type;
+    // restructuring it (e.g. adding a marker field) is out of scope for a
+    // warning-cleanup pass, so we just silence the improper_ctypes lint here.
+    #[allow(improper_ctypes)]
     extern "C" {
         fn AXUIElementCreateSystemWide() -> AXUIElementRef;
         fn AXUIElementCopyAttributeValue(
@@ -1118,6 +1132,10 @@ fn ax_window_title(pid: i32) -> Option<String> {
     type AXUIElementRef = *mut __AXUIElement;
 
     #[link(name = "ApplicationServices", kind = "framework")]
+    // __AXUIElement is a deliberately-opaque field-less FFI marker type;
+    // restructuring it (e.g. adding a marker field) is out of scope for a
+    // warning-cleanup pass, so we just silence the improper_ctypes lint here.
+    #[allow(improper_ctypes)]
     extern "C" {
         fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
         fn AXUIElementCopyAttributeValue(

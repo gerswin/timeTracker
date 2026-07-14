@@ -56,11 +56,6 @@ pub fn prompt_permissions() -> PermsStatus {
 }
 
 #[cfg(target_os = "macos")]
-pub fn screen_recording_allowed() -> bool {
-    unsafe { CGPreflightScreenCaptureAccess() }
-}
-
-#[cfg(target_os = "macos")]
 pub fn open_accessibility_pane() {
     let _ = std::process::Command::new("/usr/bin/open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
