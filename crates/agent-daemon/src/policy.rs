@@ -77,6 +77,7 @@ pub struct DropCounters {
     pub pause: std::sync::atomic::AtomicU64,
     pub excluded_app: std::sync::atomic::AtomicU64,
     pub excluded_pattern: std::sync::atomic::AtomicU64,
+    pub excluded_exe_path: std::sync::atomic::AtomicU64,
     pub throttled: std::sync::atomic::AtomicU64,
 }
 

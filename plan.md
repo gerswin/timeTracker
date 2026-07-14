@@ -9,7 +9,7 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 
 ## Estado global (auditoría 2026-07-13)
 - Último commit: 2025-09-18 — proyecto pausado ~10 meses.
-- Tests: ~~0~~ → **29 unitarios** (2026-07-14: cola, keystore, crypto, redacción, policy, heartbeat, UI embebida).
+- Tests: ~~0~~ → **95 unitarios** (2026-07-14: cola, keystore, crypto, redacción, policy, heartbeat, UI embebida, drop_reason, FocusAgg, Throttle, validación https, guard de panel).
 - Build: ~~roto~~ → **`cargo check --workspace` pasa en macOS** (2026-07-14, winreg gateado); 60 warnings restantes = 100% ruido de macros del crate `objc` viejo (requiere dep bump).
 - Plan anterior subreportaba Fase 5 (~60-70% hecha) y sobrereportaba items de cola/bootstrap; packaging completo sin trackear.
 - **Decisiones abiertas resueltas el 2026-07-13** (D1-D6): ver `docs/superpowers/specs/2026-07-13-plan-decisions-design.md`.
@@ -37,17 +37,17 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 - [x] **Clave AES en `key.bin` plaintext world-readable** junto a `queue.sqlite` (`crypto.rs:25`). **Decidido (D6): Keychain (macOS) / DPAPI (Windows) ahora**, fallback archivo 0600, migración automática de `key.bin` (keystore vía keyring + fallback 0600 + migración key.bin)
 - [x] **Títulos de ventana en plaintext en logs rotativos** a nivel info (`capture.rs:179`). **Decidido (D3): redactar título en logs salvo `RIPOR_DEBUG=1`** (redacción salvo RIPOR_DEBUG=1)
 - [x] **`/debug/drops` expone títulos sensibles excluidos** por HTTP local (`main.rs:575-577`, `policy.rs:80-85`). **Decidido (D3): título completo solo con `RIPOR_DEBUG=1`**; por defecto DropLog guarda app + razón + hash corto (DropLog redactado por defecto)
-- [ ] **Forzar `https://` en `API_BASE_URL`** (hoy se consume raw, `net.rs:34,105,267`); políticas sin firma → canal de policy (killSwitch, titleCapture, excludes) spoofeable por MITM
-- [ ] **Guard de loopback en `PANEL_ADDR`** (hoy rebind a cualquier interfaz sin validación) + bloqueo CORS/Origin explícito
-- [ ] Contabilizar drops de `excludeExePaths` con su propia razón (hoy se cuentan como `excludedPattern`, `capture.rs`, distorsiona telemetría)
+- [x] **Forzar `https://` en `API_BASE_URL`** — http solo para loopback o `RIPOR_ALLOW_HTTP=1`; URL rechazada = no configurada (warn+skip) en todos los loops y el CLI. Bypass por userinfo y terminadores WHATWG (`\ ? #`) cerrados con tests. Políticas siguen sin firma (pendiente, ver Fase 6)
+- [x] **Guard de loopback en `PANEL_ADDR`** — bind no-loopback exige `RIPOR_ALLOW_EXTERNAL_PANEL=1` (si no, fallback a 127.0.0.1:49219 sin abortar); middleware de Host-header rechaza DNS-rebinding/drive-by (403) en todas las rutas, incluyendo las mutantes (`/policy/apply`, `/pause`)
+- [x] Contabilizar drops de `excludeExePaths` con su propia razón (`ExcludedExePath` end-to-end: contador, DropLog, `dropped_by_reason`)
 
 ---
 
 ## Testing — deuda transversal (antes de nuevas features)
 - [ ] Harness de tests unitarios en workspace (hoy 0 tests). Unidades puras baratas primero:
-  - [ ] `FocusAgg` (consolidación, ráfagas, switching rápido — cubre DoD Fase 3)
-  - [ ] `Throttle::permit` (token bucket, force_emit, refill — cubre DoD Fase 4)
-  - [ ] `drop_reason` (excludeApps/Patterns/ExePaths, killSwitch, pause)
+  - [x] `FocusAgg` (consolidación, ráfagas sin huecos, switching rápido — 6 tests, cubre DoD Fase 3)
+  - [x] `Throttle::permit` (token bucket, force_emit, refill, min-interval — 6 tests, cubre DoD Fase 4)
+  - [x] `drop_reason` (excludeApps/Patterns/ExePaths, killSwitch, pause, precedencia — 14 tests)
   - [x] `crypto` roundtrip (zstd+AES-GCM, AAD device_id) + keystore (7 tests)
   - [x] Cola: enqueue/fetch/delete/attempts/GC/filas envenenadas (6 tests)
 - [ ] E2E mínimo: `smoke.sh` ya existe (build + /healthz + /state + transición ACTIVE/IDLE) — integrarlo como gate; variante Windows `win_smoke.ps1` sin ejercitar
@@ -242,7 +242,7 @@ DoD
 ## Inventario real de superficie (antes sin trackear — mantener sincronizado)
 - Endpoints daemon: `/healthz`, `/state`, `/queue`, `/panel` (SPA estática), `/` y `/ui` (inline, rota — P0), `/pause`, `/pause/clear`, `/policy/apply`, `/policy/refresh`, `/focus/blocks`, `/focus/aggregate[.csv]`, `/permissions[/prompt|/open/*]`, `/debug/drops`, `/debug/sample|windows|window|frontmost`
 - CLI: `agent policy show|pull|open|apply|edit|refresh` (faltan: `pause`, `privacy open`, `diag`)
-- Config: `.env` (`API_BASE_URL`, `PANEL_ADDR`, `IDLE_ACTIVE_THRESHOLD_MS`, `RIPOR_NO_AUTO_PROMPT`, `RIPOR_DEBUG_INGEST`, `POLICY_POLL_SECS`, `RIPOR_DEBUG`, `QUEUE_MAX_AGE_DAYS`, `QUEUE_MAX_ROWS`, `QUEUE_MAX_ATTEMPTS`…) — README documenta vars stale `EVENTS_URL`/`HEARTBEAT_URL`, corregir
+- Config: `.env` (`API_BASE_URL`, `PANEL_ADDR`, `IDLE_ACTIVE_THRESHOLD_MS`, `RIPOR_NO_AUTO_PROMPT`, `RIPOR_DEBUG_INGEST`, `POLICY_POLL_SECS`, `RIPOR_DEBUG`, `QUEUE_MAX_AGE_DAYS`, `QUEUE_MAX_ROWS`, `QUEUE_MAX_ATTEMPTS`, `RIPOR_ALLOW_HTTP`, `RIPOR_ALLOW_EXTERNAL_PANEL`…) — README documenta vars stale `EVENTS_URL`/`HEARTBEAT_URL`, corregir
 - Scripts: `smoke.sh`, `slo_idle_check.py|.sh`, `win_run.ps1`, `win_smoke.ps1`, `macos_pack|sign|notarize.sh`
 
 ---
