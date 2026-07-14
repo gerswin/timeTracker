@@ -35,6 +35,27 @@ pub struct GcStats {
     pub pruned_overflow: usize,
 }
 
+/// Añade una columna a `events` si falta. Idempotente y a prueba de carreras:
+/// varias conexiones (WAL) pueden abrir la misma base a la vez; si otra ya
+/// añadió la columna entre el chequeo y el `ALTER`, se tolera el error benigno
+/// `duplicate column name` en vez de fallar la apertura (que descartaría un
+/// evento en el loop de captura).
+fn ensure_column(conn: &Connection, name: &str, decl: &str) -> Result<()> {
+    let exists: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = ?1")?
+        .exists([name])?;
+    if exists {
+        return Ok(());
+    }
+    match conn.execute(&format!("ALTER TABLE events ADD COLUMN {decl}"), []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(m))) if m.contains("duplicate column name") => {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", &"WAL")?;
@@ -45,23 +66,16 @@ fn init_schema(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             quarantined INTEGER NOT NULL DEFAULT 0,
+            quarantined_by TEXT,
             payload BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
         CREATE INDEX IF NOT EXISTS idx_events_attempts ON events(attempts);
         ",
     )?;
-    // Migración: bases creadas antes de la columna `quarantined` la reciben
-    // aquí (ALTER falla si ya existe, así que se guarda con table_info).
-    let has_quarantined: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'quarantined'")?
-        .exists([])?;
-    if !has_quarantined {
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
+    // Migración de bases creadas antes de estas columnas.
+    ensure_column(conn, "quarantined", "quarantined INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "quarantined_by", "quarantined_by TEXT")?;
     // Índice del barrido caliente: filas entregables (quarantined=0) por edad.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_events_live ON events(quarantined, created_at);",
@@ -77,6 +91,16 @@ impl Queue {
     pub fn open_with_key(paths: &Paths, state: &AgentState, key: [u8; 32]) -> Result<Self> {
         let conn = Connection::open(paths.queue_db())?;
         init_schema(&conn)?;
+        // Recuperación en cambio de identidad: si la identidad activa difiere
+        // de la que puso una fila en cuarentena, esa fila se reconsidera bajo
+        // la identidad actual — pudo volverse recuperable (p.ej. se restauró un
+        // `state.json` anterior). La cuarentena tiene alcance de identidad, no
+        // es permanente. Preserva el invariante de no perder datos recuperables.
+        conn.execute(
+            "UPDATE events SET quarantined = 0, quarantined_by = NULL \
+             WHERE quarantined = 1 AND quarantined_by IS NOT ?1",
+            params![state.device_id],
+        )?;
         Ok(Self {
             conn,
             key,
@@ -111,6 +135,9 @@ impl Queue {
         Ok(cnt)
     }
 
+    /// Payload crudo (cifrado), sin filtrar cuarentena. NO usar para entrega:
+    /// el sender debe usar `fetch_batch_decrypted`, que salta filas poison. Se
+    /// mantiene para inspección/depuración de blobs.
     pub fn fetch_batch(&self, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
         let mut stmt = self
             .conn
@@ -189,16 +216,22 @@ impl Queue {
         }
     }
 
-    /// Marca filas como en cuarentena (no se vuelven a leer ni se borran salvo
-    /// por GC de edad).
+    /// Marca filas como en cuarentena bajo la identidad actual (`quarantined_by`
+    /// = device_id). No se vuelven a leer ni se borran salvo por GC de edad;
+    /// si la identidad cambia, `open_with_key` las reconsidera.
     fn quarantine_ids(&self, ids: &[i64]) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("UPDATE events SET quarantined = 1 WHERE id IN ({placeholders})");
-        let params: Vec<&dyn rusqlite::ToSql> =
-            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let sql =
+            format!("UPDATE events SET quarantined = 1, quarantined_by = ? WHERE id IN ({placeholders})");
+        let dev = String::from_utf8_lossy(&self.aad).into_owned();
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+        params.push(&dev);
+        for id in ids {
+            params.push(id);
+        }
         let n = self.conn.execute(&sql, params.as_slice())?;
         Ok(n)
     }
@@ -266,7 +299,7 @@ impl Queue {
     pub fn peek_decrypted(&self, limit: usize) -> Result<Vec<Vec<u8>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT payload FROM events ORDER BY created_at ASC LIMIT ?1")?;
+            .prepare("SELECT payload FROM events WHERE quarantined = 0 ORDER BY created_at ASC LIMIT ?1")?;
         let rows = stmt.query_map([limit as i64], |row| row.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for r in rows {
@@ -280,7 +313,7 @@ impl Queue {
     pub fn peek_decrypted_desc(&self, limit: usize) -> Result<Vec<Vec<u8>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT payload FROM events ORDER BY created_at DESC LIMIT ?1")?;
+            .prepare("SELECT payload FROM events WHERE quarantined = 0 ORDER BY created_at DESC LIMIT ?1")?;
         let rows = stmt.query_map([limit as i64], |row| row.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for r in rows {
@@ -643,5 +676,60 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].0, good_id);
         assert_eq!(count_quarantined(&q), 1, "migración + cuarentena funcionan");
+    }
+
+    /// La cuarentena tiene alcance de identidad: si se restaura un `state.json`
+    /// anterior (device_id vuelve al viejo), las filas que se habían puesto en
+    /// cuarentena bajo la identidad nueva se reconsideran y se entregan — no se
+    /// pierden. (Cierra el hallazgo #1 del review adversarial.)
+    #[test]
+    fn quarantine_recovered_after_identity_restore() {
+        let (_d, paths) = tmp_paths();
+        let base = now_ms();
+        // 6 filas bajo device "dev-A".
+        let mut a_ids: Vec<i64> = Vec::new();
+        {
+            let q_a = queue_dev(&paths, [7u8; 32], "dev-A");
+            for i in 0..6u64 {
+                a_ids.push(
+                    q_a.enqueue_json_at(format!(r#"{{"a":{i}}}"#).as_bytes(), base + i)
+                        .unwrap(),
+                );
+            }
+        }
+        // Cambia a device "dev-B", encola 3 buenas y drena: las 6 de A quedan
+        // en cuarentena bajo dev-B.
+        {
+            let q_b = queue_dev(&paths, [7u8; 32], "dev-B");
+            for i in 0..3u64 {
+                q_b.enqueue_json_at(format!(r#"{{"b":{i}}}"#).as_bytes(), base + 100 + i)
+                    .unwrap();
+            }
+            let mut delivered = 0;
+            for _ in 0..5 {
+                delivered = q_b.fetch_batch_decrypted(100).unwrap().len();
+                if delivered > 0 {
+                    break;
+                }
+            }
+            assert_eq!(delivered, 3, "las 3 de B se entregan");
+            assert_eq!(count_quarantined(&q_b), 6, "las 6 de A en cuarentena bajo B");
+        }
+        // Restaura device "dev-A": al abrir, las 6 en cuarentena (quarantined_by
+        // = dev-B) se reconsideran; ahora descifran y se entregan.
+        {
+            let q_a2 = queue_dev(&paths, [7u8; 32], "dev-A");
+            let delivered: Vec<i64> = q_a2
+                .fetch_batch_decrypted(100)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let mut got = delivered.clone();
+            got.sort();
+            let mut want = a_ids.clone();
+            want.sort();
+            assert_eq!(got, want, "las 6 de A se recuperan tras el restore");
+        }
     }
 }
