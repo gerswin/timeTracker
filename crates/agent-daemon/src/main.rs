@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
     });
 
     // opcional: sender de eventos si API_BASE_URL está configurado
-    if std::env::var("API_BASE_URL").is_ok() {
+    if net::api_base_url().is_some() {
         let s_state = ctx.state.clone();
         let s_paths = ctx.paths.clone();
         tokio::spawn(async move {

@@ -41,6 +41,67 @@ fn heartbeat_body(
     .expect("serializa heartbeat")
 }
 
+/// Valida el esquema de API_BASE_URL: https siempre OK; http solo para
+/// loopback (localhost, 127.0.0.1, [::1]) o si RIPOR_ALLOW_HTTP=1 (dev).
+fn validate_api_base(url: &str, allow_http: bool) -> Option<String> {
+    let trimmed = url.trim();
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        if rest.is_empty() {
+            return None;
+        }
+        if allow_http || is_loopback_host(rest) {
+            return Some(trimmed.to_string());
+        }
+        return None;
+    }
+    None
+}
+
+/// Extrae el host de la porción tras "http://" y determina si es loopback:
+/// localhost, 127.0.0.1 o [::1] (con o sin puerto/ruta, case-insensitive).
+/// Descarta el userinfo (todo hasta el último '@' de la autoridad) para que
+/// "http://localhost@evil.com/" no cuele evil.com como loopback.
+fn is_loopback_host(after_scheme: &str) -> bool {
+    // autoridad = hasta el primer terminador de autoridad (/, \, ?, #) — WHATWG special-scheme
+    let authority = after_scheme
+        .split(|c| c == '/' || c == '\\' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    // descartar userinfo: el host real es lo que sigue al último '@'
+    let hostport = authority.rsplit('@').next().unwrap_or("");
+    // separar host de :puerto (soporta [::1] y [::1]:port)
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Lee API_BASE_URL (+ RIPOR_ALLOW_HTTP) del entorno y valida el esquema.
+/// Una URL rechazada se comporta como no configurada (None), con un warn!
+/// explicando el motivo.
+pub(crate) fn api_base_url() -> Option<String> {
+    let raw = std::env::var("API_BASE_URL").ok()?;
+    let allow_http = std::env::var("RIPOR_ALLOW_HTTP").ok().as_deref() == Some("1");
+    match validate_api_base(&raw, allow_http) {
+        Some(u) => Some(u),
+        None => {
+            warn!(
+                url = %raw,
+                "API_BASE_URL rechazado: se requiere https (http solo permitido para loopback o con RIPOR_ALLOW_HTTP=1)"
+            );
+            None
+        }
+    }
+}
+
 pub async fn run_heartbeat_loop(
     state: Arc<AgentState>,
     paths: &Paths,
@@ -50,7 +111,7 @@ pub async fn run_heartbeat_loop(
 ) {
     info!("iniciando loop de heartbeat (Fase 1)");
     let client = Client::builder().build().expect("client http");
-    let api_base = std::env::var("API_BASE_URL").ok();
+    let api_base = api_base_url();
     let gc_cfg = gc_config_from_env();
     loop {
         sleep(Duration::from_secs(60)).await;
@@ -134,7 +195,7 @@ fn now_ms() -> u64 {
 
 pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
     let client = Client::builder().build().expect("client http");
-    let api_base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => { info!("API_BASE_URL no configurado; skip sender"); return; } };
+    let api_base = match api_base_url() { Some(u) => u, None => { info!("API_BASE_URL no configurado o inválido; skip sender"); return; } };
     let mut backoff = 1u64;
     loop {
         // pequeña pausa base
@@ -321,7 +382,7 @@ fn get_primary_mac() -> Option<String> {
 
 pub async fn bootstrap_if_needed(paths: &Paths, state: &AgentState) {
     if AgentSecrets::load(paths).ok().flatten().is_some() { return; }
-    let base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => { info!("API_BASE_URL no configurado; skip bootstrap"); return; } };
+    let base = match api_base_url() { Some(u) => u, None => { info!("API_BASE_URL no configurado o inválido; skip bootstrap"); return; } };
     let org = match std::env::var("ORG_ID") { Ok(v) if !v.is_empty() => v, _ => { info!("ORG_ID no configurado; skip bootstrap"); return; } };
     let user = match std::env::var("USER_EMAIL") { Ok(v) if !v.is_empty() => v, _ => { info!("USER_EMAIL no configurado; skip bootstrap"); return; } };
     let mac = get_primary_mac().unwrap_or_default();
@@ -357,7 +418,7 @@ pub async fn bootstrap_if_needed(paths: &Paths, state: &AgentState) {
 }
 
 async fn rebootstrap(paths: &Paths, state: &AgentState) -> Option<AgentSecrets> {
-    let base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => { info!("API_BASE_URL no configurado; no se puede re-bootstrap"); return None; } };
+    let base = match api_base_url() { Some(u) => u, None => { info!("API_BASE_URL no configurado o inválido; no se puede re-bootstrap"); return None; } };
     let org = match std::env::var("ORG_ID") { Ok(v) if !v.is_empty() => v, _ => { info!("ORG_ID no configurado; no se puede re-bootstrap"); return None; } };
     let user = match std::env::var("USER_EMAIL") { Ok(v) if !v.is_empty() => v, _ => { info!("USER_EMAIL no configurado; no se puede re-bootstrap"); return None; } };
     let mac = get_primary_mac().unwrap_or_default();
@@ -469,7 +530,7 @@ pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
     rt.set(initial.clone());
     let client = Client::builder().build().expect("client http");
     loop {
-        let base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => { sleep(Duration::from_secs(60)).await; continue; } };
+        let base = match api_base_url() { Some(u) => u, None => { sleep(Duration::from_secs(60)).await; continue; } };
         let user = match std::env::var("USER_EMAIL") { Ok(v) if !v.is_empty() => v, _ => { sleep(Duration::from_secs(60)).await; continue; } };
         // secrets required
         let secrets = match AgentSecrets::load(paths).ok().flatten() { Some(s) => s, None => { sleep(Duration::from_secs(30)).await; continue; } };
@@ -508,7 +569,7 @@ pub async fn run_policy_loop(paths: &Paths, rt: Arc<PolicyRuntime>) {
 
 pub async fn fetch_policy_once(paths: &Paths, rt: std::sync::Arc<PolicyRuntime>) {
     let client = Client::builder().build().expect("client http");
-    let base = match std::env::var("API_BASE_URL") { Ok(u) => u, Err(_) => return };
+    let base = match api_base_url() { Some(u) => u, None => return };
     let user = match std::env::var("USER_EMAIL") { Ok(v) if !v.is_empty() => v, _ => return };
     let secrets = match AgentSecrets::load(paths).ok().flatten() { Some(s) => s, None => return };
     let url = format!("{}/v1/policy/{}", base.trim_end_matches('/'), urlencoding::encode(&user));
@@ -583,6 +644,119 @@ mod tests {
         assert_eq!(cfg.max_age_ms, 14 * 24 * 60 * 60 * 1000);
         assert_eq!(cfg.max_rows, 100_000);
         assert_eq!(cfg.max_attempts, 50);
+    }
+
+    #[test]
+    fn validate_api_base_https_ok() {
+        assert_eq!(
+            validate_api_base("https://api.example.com", false),
+            Some("https://api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_api_base_https_remoto_con_puerto_ok() {
+        assert_eq!(
+            validate_api_base("https://api.example.com:8443", false),
+            Some("https://api.example.com:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_api_base_recorta_espacios() {
+        assert_eq!(
+            validate_api_base("  https://api.example.com  ", false),
+            Some("https://api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_api_base_http_localhost_ok() {
+        assert_eq!(
+            validate_api_base("http://localhost", false),
+            Some("http://localhost".to_string())
+        );
+        assert_eq!(
+            validate_api_base("http://localhost:8787", false),
+            Some("http://localhost:8787".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_api_base_http_127_0_0_1_ok() {
+        assert_eq!(
+            validate_api_base("http://127.0.0.1:49219", false),
+            Some("http://127.0.0.1:49219".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_api_base_http_ipv6_loopback_ok() {
+        assert_eq!(
+            validate_api_base("http://[::1]:9000", false),
+            Some("http://[::1]:9000".to_string())
+        );
+        assert_eq!(
+            validate_api_base("http://[::1]", false),
+            Some("http://[::1]".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_api_base_http_remoto_rechazado() {
+        assert_eq!(validate_api_base("http://evil.example.com", false), None);
+    }
+
+    #[test]
+    fn validate_api_base_http_remoto_con_allow_http_ok() {
+        assert_eq!(
+            validate_api_base("http://evil.example.com", true),
+            Some("http://evil.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_api_base_esquema_invalido_o_ausente() {
+        assert_eq!(validate_api_base("ftp://example.com", false), None);
+        assert_eq!(validate_api_base("garbage", false), None);
+        assert_eq!(validate_api_base("", false), None);
+    }
+
+    #[test]
+    fn validate_api_base_userinfo_no_cuela_host_remoto_como_loopback() {
+        // userinfo (parte antes de '@') no debe colar un host remoto como loopback
+        assert_eq!(validate_api_base("http://localhost:1234@evil.com/", false), None);
+        assert_eq!(validate_api_base("http://[::1]@evil.com/", false), None);
+        assert_eq!(validate_api_base("http://[::1]:9@evil.com/", false), None);
+        assert_eq!(validate_api_base("http://127.0.0.1@evil.com/", false), None);
+        // el host real es evil.com/@localhost -> evil.com (autoridad termina en '/')
+        assert_eq!(validate_api_base("http://evil.com/@localhost/", false), None);
+    }
+
+    #[test]
+    fn validate_api_base_terminadores_whatwg_no_cuelan_host_remoto() {
+        // La autoridad termina en el PRIMER de / \ ? # (WHATWG special-scheme):
+        // en estos casos el host real es evil.com, no localhost.
+        assert_eq!(validate_api_base("http://evil.com\\@localhost/", false), None);
+        assert_eq!(validate_api_base("http://evil.com#@localhost/", false), None);
+        assert_eq!(validate_api_base("http://evil.com?@localhost/", false), None);
+    }
+
+    #[test]
+    fn validate_api_base_userinfo_con_host_loopback_legitimo_ok() {
+        // loopback legítimo con userinfo sí es loopback (el host real es loopback)
+        assert_eq!(
+            validate_api_base("http://user@localhost:8080/", false).as_deref(),
+            Some("http://user@localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn validate_api_base_loopback_case_insensitive() {
+        assert_eq!(
+            validate_api_base("http://LOCALHOST/", false).as_deref(),
+            Some("http://LOCALHOST/")
+        );
     }
 
     #[test]
