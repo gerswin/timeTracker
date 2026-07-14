@@ -4,6 +4,10 @@ use std::sync::{Arc, RwLock};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+// Field names are camelCase to match the policy JSON wire format exactly
+// (no serde rename attrs); renaming would need serde(rename) churn for no
+// behavior change, so we just allow the lint here.
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Policy {
     #[serde(default)]

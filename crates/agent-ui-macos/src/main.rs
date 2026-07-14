@@ -2,7 +2,7 @@
 
 #[cfg(target_os = "macos")]
 mod app {
-    use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivateIgnoringOtherApps, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSWindow, NSControl};
+    use cocoa::appkit::{NSApp, NSApplication, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSWindow, NSControl};
     use cocoa::base::{id, nil, YES, NO};
     use cocoa::foundation::{NSAutoreleasePool, NSInteger, NSString, NSURL};
     use objc::declare::ClassDecl;
@@ -166,25 +166,24 @@ mod app {
             thread::spawn(|| loop {
                 refresh_status_title();
                 // Prefer SMAppService readback; fallback to LaunchAgent presence
-                let (login_item, enabled) = unsafe {
-                    match &HANDLER_SINGLETON {
-                        Some(a) => {
-                            let g = a.lock().unwrap();
-                            let sm_enabled = {
-                                use std::ffi::CString;
-                                let c = CString::new("com.ripor.Ripor.LoginItem").unwrap();
-                                ripor_loginitem_is_registered(c.as_ptr())
-                            };
-                            (g.login_toggle_item, if sm_enabled { true } else { is_login_enabled() })
-                        }
-                        None => (nil, false),
+                // Already inside the outer `unsafe` scope from `run()`'s body (nested
+                // closures inherit it), so no local `unsafe` block is needed here.
+                #[allow(static_mut_refs)] // pre-existing singleton pattern; not restructuring in a warning-cleanup pass
+                let (login_item, enabled) = match &HANDLER_SINGLETON {
+                    Some(a) => {
+                        let g = a.lock().unwrap();
+                        let sm_enabled = {
+                            use std::ffi::CString;
+                            let c = CString::new("com.ripor.Ripor.LoginItem").unwrap();
+                            ripor_loginitem_is_registered(c.as_ptr())
+                        };
+                        (g.login_toggle_item, if sm_enabled { true } else { is_login_enabled() })
                     }
+                    None => (nil, false),
                 };
                 if login_item != nil {
-                    unsafe {
-                        let state: NSInteger = if enabled {1} else {0};
-                        let _: () = msg_send![login_item, setState: state];
-                    }
+                    let state: NSInteger = if enabled {1} else {0};
+                    let _: () = msg_send![login_item, setState: state];
                 }
                 thread::sleep(Duration::from_secs(5));
             });
@@ -195,6 +194,7 @@ mod app {
     }
 
     fn refresh_status_title() {
+        #[allow(static_mut_refs)] // pre-existing singleton pattern; not restructuring in a warning-cleanup pass
         let (status_item, api_base, perm_ax, perm_sc) = unsafe {
             match &HANDLER_SINGLETON {
                 Some(a) => {
@@ -242,6 +242,7 @@ mod app {
     }
 
     fn http_get(path: &str) {
+        #[allow(static_mut_refs)] // pre-existing singleton pattern; not restructuring in a warning-cleanup pass
         let base = unsafe { HANDLER_SINGLETON.as_ref().unwrap().lock().unwrap().api_base.clone() };
         let url = format!("{}{}", base, path);
         thread::spawn(move || { let _ = reqwest::blocking::get(&url); });
@@ -357,8 +358,9 @@ mod app {
         if !ok { let _ = if enable { enable_login_item() } else { disable_login_item() }; }
     }
 
-    extern "C" fn onOpenPanel(this: &Object, _cmd: Sel, _sender: id) {
+    extern "C" fn onOpenPanel(_this: &Object, _cmd: Sel, _sender: id) {
         unsafe {
+            #[allow(static_mut_refs)] // pre-existing singleton pattern; not restructuring in a warning-cleanup pass
             let url_s = &HANDLER_SINGLETON.as_ref().unwrap().lock().unwrap().panel_url.clone();
             let ns_url = NSURL::alloc(nil).initWithString_(NSString::alloc(nil).init_str(url_s));
             let ws: id = msg_send![class!(NSWorkspace), sharedWorkspace];
