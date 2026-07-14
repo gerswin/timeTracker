@@ -1,9 +1,18 @@
-use crate::crypto::{decrypt_decompress, encrypt_compress, load_or_create_key};
+use crate::crypto::{decrypt_decompress, encrypt_compress};
 use crate::paths::Paths;
 use crate::state::AgentState;
 use anyhow::Result;
 use rusqlite::{params, Connection};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Timestamp (ms) del último `error!` de fallo sistémico de descifrado
+/// emitido, para limitar la frecuencia de log entre construcciones
+/// sucesivas de `Queue` (una por cada `open_with_key`).
+static LAST_SYSTEMIC_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Intervalo mínimo entre líneas de log del fallo sistémico de descifrado.
+const SYSTEMIC_LOG_THROTTLE_MS: u64 = 60_000;
 
 pub struct Queue {
     conn: Connection,
@@ -52,18 +61,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
 }
 
 impl Queue {
-    pub fn open(paths: &Paths, state: &AgentState) -> Result<Self> {
-        let key = load_or_create_key(paths)?;
-        let conn = Connection::open(paths.queue_db())?;
-        init_schema(&conn)?;
-        Ok(Self {
-            conn,
-            key,
-            aad: state.device_id.as_bytes().to_vec(),
-        })
-    }
-
-    /// Igual que `open`, pero con una clave ya cargada por el llamador (evita
+    /// Abre la cola con una clave ya cargada por el llamador (evita
     /// tocar el keystore del SO en cada apertura). Usado por el daemon, que
     /// carga la clave una sola vez al arrancar; también usado en tests para
     /// evitar el Keychain real.
@@ -138,10 +136,15 @@ impl Queue {
         }
         let total = out.len() + poison_ids.len();
         if total >= SYSTEMIC_DECRYPT_MIN_BATCH && poison_ids.len() == total {
-            tracing::error!(
-                total,
-                "fallo sistémico de descifrado en la cola (¿AAD/clave incorrecta?); no se borra nada"
-            );
+            let now = now_ms();
+            let last = LAST_SYSTEMIC_LOG_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= SYSTEMIC_LOG_THROTTLE_MS {
+                LAST_SYSTEMIC_LOG_MS.store(now, Ordering::Relaxed);
+                tracing::error!(
+                    total,
+                    "fallo sistémico de descifrado en la cola (¿AAD/clave incorrecta?); no se borra nada"
+                );
+            }
             return Ok(Vec::new());
         }
         if !poison_ids.is_empty() {
