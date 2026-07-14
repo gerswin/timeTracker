@@ -108,6 +108,7 @@ pub async fn run_heartbeat_loop(
     metrics: MetricsHandle,
     last_event_ts: Arc<AtomicU64>,
     last_heartbeat_ts: Arc<AtomicU64>,
+    key: Option<[u8; 32]>,
 ) {
     info!("iniciando loop de heartbeat (Fase 1)");
     let client = Client::builder().build().expect("client http");
@@ -116,24 +117,29 @@ pub async fn run_heartbeat_loop(
     loop {
         sleep(Duration::from_secs(60)).await;
         let last_evt = last_event_ts.load(Ordering::Relaxed);
-        let queue_len = match agent_core::queue::Queue::open(paths, &state) {
-            Ok(q) => {
-                match q.gc(&gc_cfg) {
-                    Ok(stats) => {
-                        if stats.pruned_age > 0 || stats.pruned_attempts > 0 || stats.pruned_overflow > 0 {
-                            info!(
-                                pruned_age = stats.pruned_age,
-                                pruned_attempts = stats.pruned_attempts,
-                                pruned_overflow = stats.pruned_overflow,
-                                "gc de cola: filas eliminadas"
-                            );
+        // Cola no disponible (sin clave cargada) o error al abrirla/consultarla:
+        // -1 ("desconocido"), nunca 0 (0 se confunde con "cola vacía").
+        let queue_len = match key {
+            None => -1,
+            Some(k) => match agent_core::queue::Queue::open_with_key(paths, &state, k) {
+                Ok(q) => {
+                    match q.gc(&gc_cfg) {
+                        Ok(stats) => {
+                            if stats.pruned_age > 0 || stats.pruned_attempts > 0 || stats.pruned_overflow > 0 {
+                                info!(
+                                    pruned_age = stats.pruned_age,
+                                    pruned_attempts = stats.pruned_attempts,
+                                    pruned_overflow = stats.pruned_overflow,
+                                    "gc de cola: filas eliminadas"
+                                );
+                            }
                         }
+                        Err(e) => warn!(?e, "gc de cola falló"),
                     }
-                    Err(e) => warn!(?e, "gc de cola falló"),
+                    q.queue_len().unwrap_or(-1)
                 }
-                q.queue_len().unwrap_or(0)
-            }
-            Err(_) => 0,
+                Err(_) => -1,
+            },
         };
         let m = metrics.get();
         if let Some(base) = api_base.as_deref() {
@@ -193,14 +199,14 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
+pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths, key: [u8; 32]) {
     let client = Client::builder().build().expect("client http");
     let api_base = match api_base_url() { Some(u) => u, None => { info!("API_BASE_URL no configurado o inválido; skip sender"); return; } };
     let mut backoff = 1u64;
     loop {
         // pequeña pausa base
         sleep(Duration::from_secs(5)).await;
-        let q = match agent_core::queue::Queue::open(paths, &state) {
+        let q = match agent_core::queue::Queue::open_with_key(paths, &state, key) {
             Ok(q) => q,
             Err(_) => continue,
         };

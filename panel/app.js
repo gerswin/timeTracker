@@ -22,7 +22,7 @@ async function refreshAll(){
     $('input_idle_ms').textContent = st.input_idle_ms;
     $('activity_state').textContent = st.activity_state;
     $('activity_state').className = st.activity_state;
-    $('queue_len').textContent = st.queue_len;
+    $('queue_len').textContent = st.queue_ok === false ? st.queue_len+' (no disponible)' : st.queue_len;
     $('last_event_ts').textContent = fmtTs(st.last_event_ts);
     $('last_heartbeat_ts').textContent = fmtTs(st.last_heartbeat_ts);
     $('queue').textContent = json(st.queue_preview);

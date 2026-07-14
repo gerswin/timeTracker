@@ -89,6 +89,7 @@ pub async fn run_capture_loop(
     drop_counters: Arc<crate::policy::DropCounters>,
     drop_log: Arc<crate::policy::DropLog>,
     focus_agg: std::sync::Arc<FocusAgg>,
+    key: [u8; 32],
 ) {
     info!("iniciando loop de captura (Fase 1)");
     println!("[debug] capture loop started");
@@ -148,7 +149,7 @@ pub async fn run_capture_loop(
                         // Si cumple el umbral de focus, encolar evento de bloque para el sender
                         let min_m = policy_rt.get().policy.focusMinMinutes.unwrap_or(5) as u64;
                         if block.dur_ms >= min_m.saturating_mul(60_000) {
-                            if let Ok(q) = Queue::open(paths, &state) {
+                            if let Ok(q) = Queue::open_with_key(paths, &state, key) {
                                 let fb = serde_json::json!({
                                     "type": "focus_block",
                                     "app_name": block.app_name,
@@ -174,7 +175,7 @@ pub async fn run_capture_loop(
                         }
                     }
                     debug!("abriendo queue para enqueue");
-                    if let Ok(q) = Queue::open(paths, &state) {
+                    if let Ok(q) = Queue::open_with_key(paths, &state, key) {
                         if let Ok(_) = q.enqueue_json(&serde_json::to_vec(&evt).unwrap()) {
                             last_event_ts.store(evt.ts_ms, Ordering::Relaxed);
                             info!(app = ?evt.app_name, title = %crate::policy::redact_title(&evt.window_title), "captura encolada");

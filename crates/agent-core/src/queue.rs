@@ -56,9 +56,11 @@ impl Queue {
         })
     }
 
-    /// Constructor solo para tests: evita tocar el keystore real del SO (Keychain).
-    #[cfg(test)]
-    pub(crate) fn open_with_key(paths: &Paths, state: &AgentState, key: [u8; 32]) -> Result<Self> {
+    /// Igual que `open`, pero con una clave ya cargada por el llamador (evita
+    /// tocar el keystore del SO en cada apertura). Usado por el daemon, que
+    /// carga la clave una sola vez al arrancar; también usado en tests para
+    /// evitar el Keychain real.
+    pub fn open_with_key(paths: &Paths, state: &AgentState, key: [u8; 32]) -> Result<Self> {
         let conn = Connection::open(paths.queue_db())?;
         init_schema(&conn)?;
         Ok(Self {
