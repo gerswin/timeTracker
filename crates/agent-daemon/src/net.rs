@@ -457,9 +457,14 @@ async fn rebootstrap(paths: &Paths, state: &AgentState) -> Option<AgentSecrets> 
     }
 }
 
+/// Techo de POLICY_POLL_SECS: un valor absurdamente alto no debe
+/// deshabilitar de facto el refresco de policy (killSwitch/exclusions).
+const POLICY_POLL_MAX_SECS: u64 = 3600;
+
 fn poll_secs_from(v: Option<&str>) -> u64 {
     v.and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n >= 1)
+        .map(|n| n.min(POLICY_POLL_MAX_SECS))
         .unwrap_or(10)
 }
 
@@ -513,6 +518,7 @@ async fn apply_policy_response(resp: reqwest::Response, paths: &Paths, rt: &Poli
         .map(|s| s.to_string());
     match resp.json::<serde_json::Value>().await {
         Ok(v) => {
+            // soporta respuesta con campo policy o directamente la policy rica
             let polv = v.get("policy").cloned().unwrap_or(v);
             match serde_json::from_value::<crate::policy::Policy>(polv) {
                 Ok(policy) => {
@@ -582,18 +588,13 @@ pub async fn fetch_policy_once(paths: &Paths, rt: std::sync::Arc<PolicyRuntime>)
     let etag = rt.get().etag;
     let mut req = client.get(url).header("Agent-Token", secrets.agent_token);
     if let Some(tag) = etag.as_deref() { req = req.header("If-None-Match", tag); }
-    if let Ok(resp) = req.send().await {
-        if resp.status().is_success() {
-            let hdr = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-            if let Ok(v) = resp.json::<serde_json::Value>().await {
-                let polv = v.get("policy").cloned().unwrap_or(v);
-                if let Ok(policy) = serde_json::from_value::<crate::policy::Policy>(polv) {
-                    let st = PolicyState { policy, etag: hdr };
-                    let _ = save_policy(paths, &st);
-                    rt.set(st);
-                }
-            }
+    match req.send().await {
+        Ok(resp) if resp.status().as_u16() == 304 => { /* sin cambios */ }
+        Ok(resp) if resp.status().is_success() => {
+            apply_policy_response(resp, paths, &rt).await;
         }
+        Ok(resp) => warn!(status=?resp.status(), "policy refresh manual falló"),
+        Err(e) => warn!(?e, "policy refresh manual error red"),
     }
 }
 
@@ -626,6 +627,15 @@ mod tests {
     fn poll_secs_rechaza_invalidos() {
         assert_eq!(poll_secs_from(Some("abc")), 10);
         assert_eq!(poll_secs_from(Some("0")), 10);
+    }
+
+    #[test]
+    fn poll_secs_aplica_techo_de_3600() {
+        // Un valor absurdo no debe deshabilitar el refresco de policy
+        // (killSwitch/exclusions); se clampa a 1h en vez de caer al default.
+        assert_eq!(poll_secs_from(Some("9999999")), 3600);
+        assert_eq!(poll_secs_from(Some("3600")), 3600);
+        assert_eq!(poll_secs_from(Some("3601")), 3600);
     }
 
     #[test]
