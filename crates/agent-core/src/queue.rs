@@ -11,6 +11,13 @@ pub struct Queue {
     aad: Vec<u8>,
 }
 
+/// Tamaño mínimo de tanda a partir del cual "todas las filas fallaron al
+/// descifrar" se trata como fallo sistémico (AAD/clave incorrecta) en vez
+/// de N filas poison independientes. Por debajo de este umbral, una tanda
+/// totalmente mala sigue tratándose como corrupción genuina y se drena,
+/// para no estancar una cola chica para siempre.
+const SYSTEMIC_DECRYPT_MIN_BATCH: usize = 5;
+
 /// Configuración de recolección de basura (GC) para la cola de eventos.
 pub struct GcConfig {
     pub max_age_ms: u64,
@@ -128,6 +135,14 @@ impl Queue {
                     Err(_) => poison_ids.push(id),
                 }
             }
+        }
+        let total = out.len() + poison_ids.len();
+        if total >= SYSTEMIC_DECRYPT_MIN_BATCH && poison_ids.len() == total {
+            tracing::error!(
+                total,
+                "fallo sistémico de descifrado en la cola (¿AAD/clave incorrecta?); no se borra nada"
+            );
+            return Ok(Vec::new());
         }
         if !poison_ids.is_empty() {
             tracing::warn!(
@@ -363,5 +378,89 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].0, good_id);
         assert_eq!(q.queue_len().unwrap(), 1, "poison row must be deleted");
+    }
+
+    /// Fallo sistémico: si TODA una tanda de >= SYSTEMIC_DECRYPT_MIN_BATCH
+    /// filas falla al descifrar (ej. clave equivocada, AAD desincronizado),
+    /// no debe tratarse como N filas poison independientes: no se borra
+    /// nada y se devuelve vacío para que el operador lo note.
+    #[test]
+    fn fetch_batch_decrypted_systemic_wrong_key_not_deleted() {
+        let (_d, paths) = tmp_paths();
+        let q = test_queue(&paths); // key = [7u8; 32]
+        for i in 0..5 {
+            q.enqueue_json(format!(r#"{{"i":{i}}}"#).as_bytes()).unwrap();
+        }
+        assert_eq!(q.queue_len().unwrap(), 5);
+
+        // Reabrir la misma cola con una clave distinta: cada fila falla la
+        // autenticación AEAD, como pasaría con una clave incorrecta en disco.
+        let q2 = Queue::open_with_key(&paths, &test_state(), [9u8; 32]).unwrap();
+        let batch = q2.fetch_batch_decrypted(10).unwrap();
+        assert!(batch.is_empty(), "systemic failure must not return rows");
+        assert_eq!(
+            q2.queue_len().unwrap(),
+            5,
+            "systemic failure must not delete any row"
+        );
+    }
+
+    /// Poison parcial: si solo algunas filas de la tanda son indescifrables,
+    /// se siguen borrando solo esas (comportamiento previo intacto).
+    #[test]
+    fn fetch_batch_decrypted_partial_poison_drains_only_bad_rows() {
+        let (_d, paths) = tmp_paths();
+        let q = test_queue(&paths);
+        let mut good_ids: Vec<i64> = Vec::new();
+        for i in 0..3 {
+            good_ids.push(q.enqueue_json(format!(r#"{{"i":{i}}}"#).as_bytes()).unwrap());
+        }
+        for _ in 0..2 {
+            q.conn
+                .execute(
+                    "INSERT INTO events(created_at, attempts, payload) VALUES (?1, 0, ?2)",
+                    params![now_ms() as i64, b"not encrypted garbage".to_vec()],
+                )
+                .unwrap();
+        }
+        assert_eq!(q.queue_len().unwrap(), 5);
+
+        let batch = q.fetch_batch_decrypted(10).unwrap();
+        let mut ids: Vec<i64> = batch.into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        let mut expected = good_ids.clone();
+        expected.sort();
+        assert_eq!(ids, expected, "partial poison must keep only good rows");
+        assert_eq!(
+            q.queue_len().unwrap(),
+            3,
+            "only the garbage rows should be deleted"
+        );
+    }
+
+    /// Tanda pequeña totalmente mala (< SYSTEMIC_DECRYPT_MIN_BATCH): sigue
+    /// tratándose como poison genuino y se drena, para no estancar una cola
+    /// chica en corrupción real de 1-4 filas.
+    #[test]
+    fn fetch_batch_decrypted_small_all_bad_batch_is_drained() {
+        let (_d, paths) = tmp_paths();
+        let q = test_queue(&paths);
+        for _ in 0..3 {
+            q.conn
+                .execute(
+                    "INSERT INTO events(created_at, attempts, payload) VALUES (?1, 0, ?2)",
+                    params![now_ms() as i64, b"not encrypted garbage".to_vec()],
+                )
+                .unwrap();
+        }
+        assert_eq!(q.queue_len().unwrap(), 3);
+
+        let batch = q.fetch_batch_decrypted(10).unwrap();
+        assert!(batch.is_empty());
+        assert_eq!(
+            q.queue_len().unwrap(),
+            0,
+            "small all-bad batch should still be drained"
+        );
     }
 }
