@@ -293,6 +293,11 @@ struct Throttle {
 
 impl Throttle {
     fn new() -> Self { Self { capacity: 10.0, tokens: 10.0, rate_per_sec: 10.0/60.0, last_refill_ms: now_ms(), min_interval_ms: 500, last_emit_ms: 0 } }
+    // Test-only: same defaults as new(), but with an injected last_refill_ms so
+    // tests can drive the token bucket with fully deterministic, non-wall-clock
+    // timestamps instead of racing against the real now_ms().
+    #[cfg(test)]
+    fn new_for_test(last_refill_ms: u64) -> Self { Self { capacity: 10.0, tokens: 10.0, rate_per_sec: 10.0/60.0, last_refill_ms, min_interval_ms: 500, last_emit_ms: 0 } }
     fn update_from_policy(&mut self, pol: &crate::policy::Policy) {
         if let Some(bpm) = pol.titleBurstPerMinute { let cap = bpm.max(1) as f64; self.capacity = cap; self.rate_per_sec = cap/60.0; if self.tokens > self.capacity { self.tokens = self.capacity; } }
         if let Some(hz) = pol.titleSampleHz { let hz = hz.max(1) as u64; self.min_interval_ms = (1000 / hz).max(100); }
@@ -1361,5 +1366,206 @@ mod tests {
         let pol = state(p);
         assert_eq!(drop_reason(&pol, "Safari", "title"), Some(DropReason::ExcludedApp));
         assert_eq!(drop_reason(&pol, "Chrome", "title"), None);
+    }
+
+    // --- FocusAgg -----------------------------------------------------
+
+    // FocusBlockDto doesn't derive PartialEq (it's a wire DTO, not needed in
+    // production), so tests compare fields directly rather than adding a derive
+    // purely for test convenience.
+    fn assert_block(b: &FocusBlockDto, app: &str, title: &str, start: u64, end: u64) {
+        assert_eq!(b.app_name, app);
+        assert_eq!(b.window_title, title);
+        assert_eq!(b.start_ms, start);
+        assert_eq!(b.end_ms, end);
+        assert_eq!(b.dur_ms, end - start);
+    }
+
+    #[test]
+    fn focus_agg_same_app_title_repeated_returns_none() {
+        let agg = FocusAgg::new();
+        assert!(agg.on_event(1_000, "VSCode", "main.rs").is_none());
+        assert!(agg.on_event(2_000, "VSCode", "main.rs").is_none());
+        assert!(agg.on_event(3_000, "VSCode", "main.rs").is_none());
+    }
+
+    #[test]
+    fn focus_agg_switch_app_finalizes_previous_block() {
+        let agg = FocusAgg::new();
+        assert!(agg.on_event(1_000, "VSCode", "main.rs").is_none());
+        assert!(agg.on_event(2_000, "VSCode", "main.rs").is_none());
+        let block = agg.on_event(3_000, "Chrome", "docs").expect("block on app switch");
+        assert_block(&block, "VSCode", "main.rs", 1_000, 2_000);
+    }
+
+    #[test]
+    fn focus_agg_switch_title_same_app_finalizes() {
+        let agg = FocusAgg::new();
+        assert!(agg.on_event(1_000, "VSCode", "main.rs").is_none());
+        assert!(agg.on_event(2_000, "VSCode", "main.rs").is_none());
+        let block = agg.on_event(3_000, "VSCode", "lib.rs").expect("block on title switch");
+        assert_block(&block, "VSCode", "main.rs", 1_000, 2_000);
+    }
+
+    #[test]
+    fn focus_agg_rapid_switching_has_no_gaps_between_blocks() {
+        let agg = FocusAgg::new();
+        // Each transition is fed as a confirming sample of the outgoing state at
+        // ts=T immediately followed by the first sample of the incoming state at
+        // the SAME ts=T. on_event finalizes a block as (block_start, last
+        // confirmed ts of that state) and starts the next block at the ts of the
+        // switching call, so sharing T at the boundary is what makes
+        // block[i].end_ms == block[i+1].start_ms (no gap between bursts).
+        assert!(agg.on_event(1_000, "A", "tA").is_none());
+        assert!(agg.on_event(2_000, "A", "tA").is_none()); // confirm A up to 2_000
+        let b1 = agg.on_event(2_000, "B", "tB").expect("A -> B"); // switch at same ts
+        assert!(agg.on_event(3_000, "B", "tB").is_none()); // confirm B up to 3_000
+        let b2 = agg.on_event(3_000, "A", "tA").expect("B -> A");
+        assert!(agg.on_event(4_000, "A", "tA").is_none()); // confirm 2nd A up to 4_000
+        let b3 = agg.on_event(4_000, "C", "tC").expect("A -> C (flush)");
+
+        assert_block(&b1, "A", "tA", 1_000, 2_000);
+        assert_block(&b2, "B", "tB", 2_000, 3_000);
+        assert_block(&b3, "A", "tA", 3_000, 4_000);
+
+        assert_eq!(b1.end_ms, b2.start_ms);
+        assert_eq!(b2.end_ms, b3.start_ms);
+    }
+
+    #[test]
+    fn focus_agg_recent_filters_by_duration_and_respects_limit() {
+        let agg = FocusAgg::new();
+        // Start at ts=1_000, not 0: block_start uses 0 as its own "unset"
+        // sentinel internally, so a first-ever event at ts=0 would never get
+        // finalized. Real callers use now_ms() (epoch millis), which is never
+        // 0 in practice, so this doesn't arise outside of a contrived test.
+        // Block A: 10 min (qualifies for a 5-min threshold)
+        assert!(agg.on_event(1_000, "App-A", "t").is_none());
+        assert!(agg.on_event(601_000, "App-A", "t").is_none());
+        // Block B: 2 min (too short for a 5-min threshold)
+        assert!(agg.on_event(601_000, "App-B", "t").is_some());
+        assert!(agg.on_event(721_000, "App-B", "t").is_none());
+        // Block C: 8 min (qualifies)
+        assert!(agg.on_event(721_000, "App-C", "t").is_some());
+        assert!(agg.on_event(1_201_000, "App-C", "t").is_none());
+        // Block D: 1 min (too short), flushed by a final switch
+        assert!(agg.on_event(1_201_000, "App-D", "t").is_some());
+        assert!(agg.on_event(1_261_000, "App-D", "t").is_none());
+        assert!(agg.on_event(1_261_000, "App-E", "t").is_some());
+
+        // min_minutes = 5 (300_000ms) drops B (2 min) and D (1 min); most-recent first.
+        let filtered = agg.recent(10, 5);
+        assert_eq!(filtered.len(), 2);
+        assert_block(&filtered[0], "App-C", "t", 721_000, 1_201_000);
+        assert_block(&filtered[1], "App-A", "t", 1_000, 601_000);
+
+        // limit = 1 with no duration filter returns only the single most recent block.
+        let limited = agg.recent(1, 0);
+        assert_eq!(limited.len(), 1);
+        assert_block(&limited[0], "App-D", "t", 1_201_000, 1_261_000);
+    }
+
+    #[test]
+    fn focus_agg_ongoing_block_invisible_until_finalized() {
+        // Documents a known design quirk: an in-progress block is not reflected
+        // in recent() at all, no matter how long it has been running, until a
+        // switch finalizes it. (Starts at ts=1_000 for the same reason as above:
+        // ts=0 collides with the block_start "unset" sentinel.)
+        let agg = FocusAgg::new();
+        assert!(agg.on_event(1_000, "VSCode", "main.rs").is_none());
+        assert!(agg.on_event(601_000, "VSCode", "main.rs").is_none()); // 10 min, still ongoing
+        assert!(agg.recent(10, 1).is_empty());
+
+        let block = agg.on_event(701_000, "Chrome", "docs").expect("switch finalizes it");
+        assert_block(&block, "VSCode", "main.rs", 1_000, 601_000);
+
+        let recent = agg.recent(10, 1);
+        assert_eq!(recent.len(), 1);
+        assert_block(&recent[0], "VSCode", "main.rs", 1_000, 601_000);
+    }
+
+    // --- Throttle -------------------------------------------------------
+
+    const BASE_MS: u64 = 1_000_000;
+
+    #[test]
+    fn throttle_fresh_bucket_allows_burst_up_to_capacity_then_denies() {
+        let mut thr = Throttle::new_for_test(BASE_MS);
+        // Default capacity is 10; space calls exactly at the 500ms min-interval
+        // floor so every call in the burst clears the debounce check too.
+        for i in 0..10u64 {
+            let now = BASE_MS + i * 500;
+            assert!(thr.permit(now, false), "permit #{i} should be granted");
+        }
+        let now = BASE_MS + 10 * 500;
+        assert!(!thr.permit(now, false), "11th permit should be denied: bucket exhausted");
+    }
+
+    #[test]
+    fn throttle_tokens_refill_over_time_after_denial() {
+        let mut thr = Throttle::new_for_test(BASE_MS);
+        for i in 0..10u64 {
+            let now = BASE_MS + i * 500;
+            assert!(thr.permit(now, false));
+        }
+        let denied_at = BASE_MS + 10 * 500;
+        assert!(!thr.permit(denied_at, false), "bucket should be exhausted");
+
+        // Default refill rate is 10 tokens/min; advancing far enough regenerates
+        // at least one token even though it was just denied.
+        let refilled_at = denied_at + 7_000;
+        assert!(thr.permit(refilled_at, false), "should allow again once tokens refill");
+    }
+
+    #[test]
+    fn throttle_min_interval_denies_second_permit_too_soon() {
+        let mut thr = Throttle::new_for_test(BASE_MS);
+        assert!(thr.permit(BASE_MS, false));
+        assert!(!thr.permit(BASE_MS + 100, false), "100ms < default 500ms min interval");
+        assert!(thr.permit(BASE_MS + 600, false), "600ms respects the min interval");
+    }
+
+    #[test]
+    fn throttle_force_skips_min_interval_but_still_consumes_tokens() {
+        let mut thr = Throttle::new_for_test(BASE_MS);
+        // 10 forced permits, 1ms apart (well under the 500ms min interval),
+        // succeed purely because the bucket starts with 10 tokens.
+        for i in 0..10u64 {
+            assert!(thr.permit(BASE_MS + i, true), "forced permit #{i} should be granted");
+        }
+        // force=true skips only the min-interval debounce, not the token check:
+        // an empty bucket still denies.
+        assert!(!thr.permit(BASE_MS + 10, true), "forced permit should be denied when bucket is empty");
+    }
+
+    #[test]
+    fn throttle_update_from_policy_title_burst_per_minute_changes_capacity() {
+        let mut thr = Throttle::new_for_test(BASE_MS);
+        let pol = Policy { titleBurstPerMinute: Some(2), ..Policy::default() };
+        thr.update_from_policy(&pol);
+        // Capacity (and current tokens, clamped down) drop from 10 to 2.
+        assert!(thr.permit(BASE_MS, false));
+        assert!(thr.permit(BASE_MS + 600, false));
+        assert!(!thr.permit(BASE_MS + 1_200, false), "capacity should now be 2, not the original 10");
+    }
+
+    #[test]
+    fn throttle_update_from_policy_title_sample_hz_changes_min_interval() {
+        let mut thr = Throttle::new_for_test(BASE_MS);
+        let pol = Policy { titleSampleHz: Some(2), ..Policy::default() };
+        thr.update_from_policy(&pol);
+        // sampleHz=2 -> min interval = 1000/2 = 500ms, same as the default: a
+        // 400ms gap is still denied, exactly 500ms is still accepted.
+        assert!(thr.permit(BASE_MS, false));
+        assert!(!thr.permit(BASE_MS + 400, false));
+        assert!(thr.permit(BASE_MS + 500, false));
+
+        // A much higher sampleHz clamps to the 100ms floor rather than going lower.
+        let mut thr2 = Throttle::new_for_test(BASE_MS);
+        let pol2 = Policy { titleSampleHz: Some(50), ..Policy::default() };
+        thr2.update_from_policy(&pol2);
+        assert!(thr2.permit(BASE_MS, false));
+        assert!(!thr2.permit(BASE_MS + 50, false), "raw 1000/50=20ms should be floored to 100ms");
+        assert!(thr2.permit(BASE_MS + 100, false));
     }
 }
