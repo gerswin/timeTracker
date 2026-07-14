@@ -48,6 +48,15 @@ pub fn load_or_create_key_with(backend: &dyn KeyBackend, paths: &Paths) -> Resul
         Ok(Some(k)) if k.len() == KEY_LEN => {
             let mut out = [0u8; KEY_LEN];
             out.copy_from_slice(&k);
+            // La clave ya vive en el keystore: si quedó un key.bin colgado de
+            // una migración previa cuyo borrado falló, lo limpiamos ahora
+            // (best-effort; la clave ya está a salvo en el keystore).
+            let legacy = paths.key_file();
+            if legacy.exists() {
+                if let Err(e) = fs::remove_file(&legacy) {
+                    tracing::warn!(?e, "no se pudo borrar key.bin residual (clave ya en keystore)");
+                }
+            }
             return Ok(out);
         }
         Ok(Some(_)) => return Err(anyhow!("clave en keystore con tamaño inválido")),
@@ -211,6 +220,23 @@ mod tests {
         let k = load_or_create_key_with(&backend, &paths).unwrap();
         assert_eq!(k, existente);
         assert!(!paths.key_file().exists());
+    }
+
+    #[test]
+    fn clave_existente_en_keystore_limpia_key_bin_residual() {
+        // Simula el caso de una migración previa cuyo fs::remove_file(key.bin)
+        // falló (p.ej. permisos transitorios): la clave ya está en el
+        // keystore, pero key.bin quedó abandonado en disco. La próxima carga
+        // exitosa desde el keystore debe limpiarlo (best-effort).
+        let (_d, paths) = tmp_paths();
+        let backend = MemBackend::new();
+        let existente: [u8; 32] = [11u8; 32];
+        backend.set(&existente).unwrap();
+        std::fs::write(paths.key_file(), [99u8; 32]).unwrap();
+        assert!(paths.key_file().exists());
+        let k = load_or_create_key_with(&backend, &paths).unwrap();
+        assert_eq!(k, existente, "debe devolver la clave del keystore, no la de key.bin");
+        assert!(!paths.key_file().exists(), "key.bin residual debe borrarse");
     }
 
     struct SetFailBackend;

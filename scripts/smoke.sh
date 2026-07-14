@@ -79,12 +79,10 @@ if curl -sf "${BASE}/permissions" >/dev/null; then
       echo "[smoke] /debug/sample:"
       SAMPLE=$(curl -s "${BASE}/debug/sample")
       echo "$SAMPLE"
-      TITLE_SRC=$(printf '%s' "$SAMPLE" | python3 -c 'import sys, json;\
-import sys, json\
-\
-try:\
-    d=json.load(sys.stdin); print(d.get("title_source",""))\
-except Exception:\
+      TITLE_SRC=$(printf '%s' "$SAMPLE" | python3 -c 'import sys, json
+try:
+    d = json.load(sys.stdin); print(d.get("title_source", ""))
+except Exception:
     print("")')
       if [ "$TITLE_SRC" = "none" ] || [ -z "$TITLE_SRC" ]; then
         echo "[smoke][FAIL] title_source es '$TITLE_SRC' pese a permisos concedidos" >&2

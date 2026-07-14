@@ -44,6 +44,10 @@ struct AppCtx {
     paths: agent_core::paths::Paths,
     metrics: MetricsHandle,
     version: String,
+    /// Clave AES de la cola, cargada una única vez al arrancar (ver `main`).
+    /// `None` si el keystore no estuvo disponible dentro del timeout: el
+    /// daemon sigue sirviendo el panel en modo degradado, sin cola.
+    queue_key: Option<[u8; 32]>,
     last_event_ts: Arc<AtomicU64>,
     last_heartbeat_ts: Arc<AtomicU64>,
     last_idle_ms: Arc<AtomicU64>,
@@ -66,6 +70,7 @@ struct StateDto {
     device_id: String,
     agent_version: String,
     queue_len: i64,
+    queue_ok: bool,
     cpu_pct: f32,
     mem_mb: u64,
     last_event_ts: u64,
@@ -102,11 +107,48 @@ async fn main() -> Result<()> {
     let metrics_bg = metrics.clone();
     tokio::spawn(async move { metrics_bg.run_sampler().await });
 
+    // Carga la clave AES de la cola UNA sola vez, fuera del hilo del runtime
+    // (spawn_blocking) y acotada por timeout: load_or_create_key() hace una
+    // llamada SÍNCRONA al keystore del SO que, en un entorno headless/sin
+    // sesión de Keychain (CI, arranque sin login), puede bloquear para
+    // siempre. Como el runtime es current_thread (un solo hilo, requerido
+    // por las APIs de UI en macOS), ese bloqueo pararía TODO: panel,
+    // heartbeat y captura. Si el timeout se agota o el keystore falla, el
+    // daemon sigue arrancando en modo degradado: sin cola (no se captura ni
+    // se envían eventos), pero el panel sigue sirviendo.
+    let key_paths = paths.clone();
+    let timeout_secs = std::env::var("RIPOR_KEYSTORE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(5);
+    let queue_key: Option<[u8; 32]> = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        tokio::task::spawn_blocking(move || agent_core::keystore::load_or_create_key(&key_paths)),
+    )
+    .await
+    {
+        Ok(Ok(Ok(k))) => Some(k),
+        Ok(Ok(Err(e))) => {
+            tracing::error!(?e, "no se pudo cargar la clave de la cola; modo degradado sin cola");
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::error!(?e, "panic cargando la clave de la cola; modo degradado");
+            None
+        }
+        Err(_) => {
+            tracing::error!(timeout_secs, "timeout cargando la clave de la cola (keystore no disponible?); modo degradado sin cola");
+            None
+        }
+    };
+
     let ctx = AppCtx {
         state: Arc::new(state),
         paths,
         metrics: metrics.clone(),
         version: version.clone(),
+        queue_key,
         last_event_ts: Arc::new(AtomicU64::new(0)),
         last_heartbeat_ts: Arc::new(AtomicU64::new(0)),
         last_idle_ms: Arc::new(AtomicU64::new(0)),
@@ -207,23 +249,39 @@ async fn main() -> Result<()> {
     // lanzar tareas de captura y heartbeat antes de iniciar servidor
     info!("spawning capture and heartbeat tasks");
     println!("[debug] spawning capture/heartbeat tasks");
-    // debug: se puede verificar la captura con logs del loop
-    let bg_state1 = ctx.state.clone();
-    let bg_paths1 = ctx.paths.clone();
-    let last_event1 = ctx.last_event_ts.clone();
-    let last_idle1 = ctx.last_idle_ms.clone();
-    let paused1 = ctx.paused_until_ms.clone();
-    let pol1 = ctx.policy_rt.clone();
-    let dropped1 = ctx.dropped_events.clone();
-    let dropc1 = ctx.drop_counters.clone();
-    let droplog1 = ctx.drop_log.clone();
-    let focus1 = ctx.focus_agg.clone();
-    tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1, dropc1, droplog1, focus1).await; });
+    // Captura y sender solo se lanzan si se pudo cargar la clave de la cola:
+    // sin clave no hay dónde encolar ni qué enviar (modo degradado).
+    if let Some(key) = ctx.queue_key {
+        // debug: se puede verificar la captura con logs del loop
+        let bg_state1 = ctx.state.clone();
+        let bg_paths1 = ctx.paths.clone();
+        let last_event1 = ctx.last_event_ts.clone();
+        let last_idle1 = ctx.last_idle_ms.clone();
+        let paused1 = ctx.paused_until_ms.clone();
+        let pol1 = ctx.policy_rt.clone();
+        let dropped1 = ctx.dropped_events.clone();
+        let dropc1 = ctx.drop_counters.clone();
+        let droplog1 = ctx.drop_log.clone();
+        let focus1 = ctx.focus_agg.clone();
+        tokio::spawn(async move { capture::run_capture_loop(bg_state1.clone(), &bg_paths1, last_event1, last_idle1, paused1, pol1, dropped1, dropc1, droplog1, focus1, key).await; });
+
+        // opcional: sender de eventos si API_BASE_URL está configurado
+        if net::api_base_url().is_some() {
+            let s_state = ctx.state.clone();
+            let s_paths = ctx.paths.clone();
+            tokio::spawn(async move {
+                net::run_sender_loop(s_state.clone(), &s_paths, key).await;
+            });
+        }
+    } else {
+        tracing::warn!("modo degradado: captura y envío de eventos deshabilitados (sin clave de cola)");
+    }
     let bg_state2 = ctx.state.clone();
     let bg_paths2 = ctx.paths.clone();
     let bg_metrics2 = ctx.metrics.clone();
     let last_event2 = ctx.last_event_ts.clone();
     let last_hb2 = ctx.last_heartbeat_ts.clone();
+    let hb_key2 = ctx.queue_key;
     tokio::spawn(async move {
         net::run_heartbeat_loop(
             bg_state2.clone(),
@@ -231,18 +289,13 @@ async fn main() -> Result<()> {
             bg_metrics2.clone(),
             last_event2,
             last_hb2,
+            hb_key2,
         )
         .await;
     });
 
-    // opcional: sender de eventos si API_BASE_URL está configurado
+    // policy fetch loop: independiente de la cola, solo depende de API_BASE_URL
     if net::api_base_url().is_some() {
-        let s_state = ctx.state.clone();
-        let s_paths = ctx.paths.clone();
-        tokio::spawn(async move {
-            net::run_sender_loop(s_state.clone(), &s_paths).await;
-        });
-        // policy fetch loop
         let p_paths = ctx.paths.clone();
         let prt = ctx.policy_rt.clone();
         tokio::spawn(async move { net::run_policy_loop(&p_paths, prt).await; });
@@ -336,23 +389,30 @@ async fn panel_styles() -> impl IntoResponse {
 
 async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
     let metrics: AgentMetrics = ctx.metrics.get();
-    // abrir la cola solo para consultar la longitud
-    let (queue_len, queue_preview) = match agent_core::queue::Queue::open(&ctx.paths, &ctx.state) {
-        Ok(q) => {
-            let len = q.queue_len().unwrap_or(0);
-            // Mostrar los 5 más recientes
-            let dec = q.peek_decrypted_desc(5).unwrap_or_default();
-            let mut items = Vec::new();
-            for b in dec {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
-                    items.push(v);
-                } else {
-                    items.push(serde_json::json!({"raw": base64::engine::general_purpose::STANDARD.encode(b)}));
+    // abrir la cola (con la clave ya cargada al arrancar) solo para consultarla.
+    // Sin clave, o si falla la apertura/consulta, se reporta queue_len=-1 +
+    // queue_ok=false: nunca 0, que se confundiría con "cola vacía".
+    let (queue_len, queue_ok, queue_preview) = match ctx.queue_key {
+        None => (-1, false, Vec::new()),
+        Some(key) => match agent_core::queue::Queue::open_with_key(&ctx.paths, &ctx.state, key) {
+            Ok(q) => match q.queue_len() {
+                Ok(len) => {
+                    // Mostrar los 5 más recientes
+                    let dec = q.peek_decrypted_desc(5).unwrap_or_default();
+                    let mut items = Vec::new();
+                    for b in dec {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
+                            items.push(v);
+                        } else {
+                            items.push(serde_json::json!({"raw": base64::engine::general_purpose::STANDARD.encode(b)}));
+                        }
+                    }
+                    (len, true, items)
                 }
-            }
-            (len, items)
-        }
-        Err(_) => (0, Vec::new()),
+                Err(_) => (-1, false, Vec::new()),
+            },
+            Err(_) => (-1, false, Vec::new()),
+        },
     };
     // permisos
     #[cfg(target_os = "macos")]
@@ -365,6 +425,7 @@ async fn state_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<StateDto> {
         device_id: ctx.state.device_id.clone(),
         agent_version: ctx.state.agent_version.clone(),
         queue_len,
+        queue_ok,
         cpu_pct: metrics.cpu_pct,
         mem_mb: metrics.mem_mb,
         last_event_ts: ctx.last_event_ts.load(Ordering::Relaxed),
@@ -659,23 +720,29 @@ async fn queue_handler(
     Query(params): Query<QueueParams>,
 ) -> Json<QueueDto> {
     let limit = params.limit.unwrap_or(10).min(100).max(1);
-    let q = agent_core::queue::Queue::open(&ctx.paths, &ctx.state);
-    let (len, items) = match q {
-        Ok(q) => {
-            let len = q.queue_len().unwrap_or(0);
-            // Mostrar los últimos N en cola (más recientes primero)
-            let dec = q.peek_decrypted_desc(limit).unwrap_or_default();
-            let mut top = Vec::new();
-            for b in dec {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
-                    top.push(v);
-                } else {
-                    top.push(serde_json::json!({"raw": base64::engine::general_purpose::STANDARD.encode(b)}));
+    // Sin clave (modo degradado) o error al abrir/consultar la cola:
+    // queue_len=-1 ("desconocido"), nunca 0.
+    let (len, items) = match ctx.queue_key {
+        None => (-1, Vec::new()),
+        Some(key) => match agent_core::queue::Queue::open_with_key(&ctx.paths, &ctx.state, key) {
+            Ok(q) => match q.queue_len() {
+                Ok(len) => {
+                    // Mostrar los últimos N en cola (más recientes primero)
+                    let dec = q.peek_decrypted_desc(limit).unwrap_or_default();
+                    let mut top = Vec::new();
+                    for b in dec {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
+                            top.push(v);
+                        } else {
+                            top.push(serde_json::json!({"raw": base64::engine::general_purpose::STANDARD.encode(b)}));
+                        }
+                    }
+                    (len, top)
                 }
-            }
-            (len, top)
-        }
-        Err(_) => (0, Vec::new()),
+                Err(_) => (-1, Vec::new()),
+            },
+            Err(_) => (-1, Vec::new()),
+        },
     };
     Json(QueueDto {
         queue_len: len,
