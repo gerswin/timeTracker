@@ -9,10 +9,11 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 
 ## Estado global (auditoría 2026-07-13)
 - Último commit: 2025-09-18 — proyecto pausado ~10 meses.
-- Tests: ~~0~~ → **95 unitarios** (2026-07-14: cola, keystore, crypto, redacción, policy, heartbeat, UI embebida, drop_reason, FocusAgg, Throttle, validación https, guard de panel).
+- Tests: ~~0~~ → **101 unitarios** (2026-07-14: cola, keystore, crypto, redacción, policy, heartbeat, UI embebida, drop_reason, FocusAgg, Throttle, validación https, guard de panel, safety valve de poison, techo de poll).
 - Build: ~~roto~~ → **`cargo check --workspace` pasa en macOS** (2026-07-14, winreg gateado); 60 warnings restantes = 100% ruido de macros del crate `objc` viejo (requiere dep bump).
 - Plan anterior subreportaba Fase 5 (~60-70% hecha) y sobrereportaba items de cola/bootstrap; packaging completo sin trackear.
 - **Decisiones abiertas resueltas el 2026-07-13** (D1-D6): ver `docs/superpowers/specs/2026-07-13-plan-decisions-design.md`.
+- **Follow-ups resueltos 2026-07-14**: clave de cola cargada 1 vez al arranque con timeout (no cuelga en headless/CI; `queue_len=-1`+`queue_ok=false` en modo degradado en vez de fingir cola vacía); safety valve anti-borrado en fallo sistémico de descifrado (≥5 filas todas malas → no borra); `POLICY_POLL_SECS` con techo 1h; `fetch_policy_once` deduplicado; parser de smoke.sh arreglado.
 
 ## SLOs (métricas objetivo)
 - [ ] CPU p95 ≤ 1% (medido solo macOS idle: p95≈0.13% ✓, `slo_mac.json`; falta Windows y bajo carga; Linux → v2)
@@ -50,7 +51,7 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
   - [x] `drop_reason` (excludeApps/Patterns/ExePaths, killSwitch, pause, precedencia — 14 tests)
   - [x] `crypto` roundtrip (zstd+AES-GCM, AAD device_id) + keystore (7 tests)
   - [x] Cola: enqueue/fetch/delete/attempts/GC/filas envenenadas (6 tests)
-- [ ] E2E mínimo: `smoke.sh` ya existe (build + /healthz + /state + transición ACTIVE/IDLE) — integrarlo como gate; variante Windows `win_smoke.ps1` sin ejercitar
+- [ ] E2E mínimo: `smoke.sh` (build + /healthz + /state + transición ACTIVE/IDLE; parser `/debug/sample` arreglado 2026-07-14) — falta integrarlo como gate CI; variante Windows `win_smoke.ps1` sin ejercitar
 
 ---
 
