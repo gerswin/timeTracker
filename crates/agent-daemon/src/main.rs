@@ -248,8 +248,10 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { net::run_policy_loop(&p_paths, prt).await; });
     }
 
+    let allow_external_panel =
+        std::env::var("RIPOR_ALLOW_EXTERNAL_PANEL").ok().as_deref() == Some("1");
     let addr_str = std::env::var("PANEL_ADDR").unwrap_or_else(|_| DEFAULT_PANEL_ADDR.to_string());
-    let addr: SocketAddr = match addr_str.parse() {
+    let mut addr: SocketAddr = match addr_str.parse() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(addr = %addr_str, error = %e, "PANEL_ADDR inválido. Usa formato host:puerto, p.ej. 127.0.0.1:49219");
@@ -257,6 +259,26 @@ async fn main() -> Result<()> {
             return Err(anyhow::anyhow!("PANEL_ADDR inválido"));
         }
     };
+    if !panel_bind_is_allowed(&addr, allow_external_panel) {
+        tracing::error!(
+            addr = %addr,
+            fallback = %DEFAULT_PANEL_ADDR,
+            "PANEL_ADDR no-loopback rechazado: falta RIPOR_ALLOW_EXTERNAL_PANEL=1; usando dirección por defecto"
+        );
+        eprintln!(
+            "[error] El panel se niega a escuchar en {} (no es loopback) sin RIPOR_ALLOW_EXTERNAL_PANEL=1. Usando {} en su lugar.",
+            addr, DEFAULT_PANEL_ADDR
+        );
+        addr = DEFAULT_PANEL_ADDR
+            .parse()
+            .expect("DEFAULT_PANEL_ADDR es una dirección válida");
+    } else if allow_external_panel {
+        tracing::info!(addr = %addr, "RIPOR_ALLOW_EXTERNAL_PANEL=1: guard de Host desactivado, bind externo permitido explícitamente");
+    }
+    let bind_ip = addr.ip().to_string();
+    let app = app.layer(axum::middleware::from_fn(move |req, next| {
+        panel_host_guard(bind_ip.clone(), allow_external_panel, req, next)
+    }));
     info!("panel escuchando en http://{}", addr);
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -490,6 +512,61 @@ async fn pause_handler(
 async fn pause_clear_handler(AxumState(ctx): AxumState<AppCtx>) -> Json<serde_json::Value> {
     ctx.paused_until_ms.store(0, Ordering::Relaxed);
     Json(serde_json::json!({"ok": true}))
+}
+
+/// True si el bind solicitado es seguro por defecto (loopback) o si el
+/// operador lo permitió explícitamente vía RIPOR_ALLOW_EXTERNAL_PANEL=1.
+fn panel_bind_is_allowed(addr: &SocketAddr, allow_external: bool) -> bool {
+    addr.ip().is_loopback() || allow_external
+}
+
+/// True si `host` (valor de la cabecera Host, con o sin `:puerto`) es
+/// loopback: "127.0.0.1", "localhost", "[::1]", con o sin puerto, o si
+/// coincide con la IP a la que el panel está enlazado (`bind_ip`, p.ej.
+/// "127.0.0.2" para un bind loopback no estándar). No valida el puerto: una
+/// petición solo llega a este listener por el puerto realmente enlazado, así
+/// que el puerto del Host no aporta seguridad. No valida esquema ni userinfo
+/// (la cabecera Host no los lleva).
+fn host_is_local(host: &str, bind_ip: &str) -> bool {
+    let h = host.trim();
+    if h.is_empty() {
+        return false;
+    }
+    let name = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        h.split(':').next().unwrap_or("")
+    };
+    let name = name.to_ascii_lowercase();
+    matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1")
+        || name == bind_ip.to_ascii_lowercase()
+}
+
+/// Middleware: rechaza (403) peticiones cuya cabecera Host no sea loopback,
+/// mitigando ataques de DNS-rebinding / drive-by contra endpoints que mutan
+/// estado (p.ej. /policy/apply, /pause) aunque el panel esté en 127.0.0.1.
+/// Se omite por completo si el operador optó por exponer el panel
+/// externamente (RIPOR_ALLOW_EXTERNAL_PANEL=1).
+async fn panel_host_guard(
+    bind_ip: String,
+    allow_external: bool,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if allow_external {
+        return next.run(req).await;
+    }
+    let ok = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| host_is_local(h, &bind_ip))
+        .unwrap_or(false);
+    if ok {
+        next.run(req).await
+    } else {
+        axum::http::StatusCode::FORBIDDEN.into_response()
+    }
 }
 
 fn now_ms() -> u64 {
@@ -741,5 +818,154 @@ mod tests {
         assert!(PANEL_INDEX.contains("btn-refresh-policy"));
         assert!(PANEL_APP_JS.contains("refreshAll"));
         assert!(!PANEL_CSS.is_empty());
+    }
+
+    #[test]
+    fn panel_bind_is_allowed_loopback_sin_opt_in() {
+        let addr: SocketAddr = "127.0.0.1:49219".parse().unwrap();
+        assert!(panel_bind_is_allowed(&addr, false));
+    }
+
+    #[test]
+    fn panel_bind_is_allowed_no_loopback_sin_opt_in_rechaza() {
+        let addr: SocketAddr = "0.0.0.0:49219".parse().unwrap();
+        assert!(!panel_bind_is_allowed(&addr, false));
+    }
+
+    #[test]
+    fn panel_bind_is_allowed_no_loopback_con_opt_in() {
+        let addr: SocketAddr = "0.0.0.0:49219".parse().unwrap();
+        assert!(panel_bind_is_allowed(&addr, true));
+    }
+
+    #[test]
+    fn panel_bind_is_allowed_ipv6_loopback_sin_opt_in() {
+        let addr: SocketAddr = "[::1]:49219".parse().unwrap();
+        assert!(panel_bind_is_allowed(&addr, false));
+    }
+
+    #[test]
+    fn host_is_local_ipv4_sin_puerto() {
+        assert!(host_is_local("127.0.0.1", "127.0.0.1"));
+    }
+
+    #[test]
+    fn host_is_local_ipv4_con_puerto() {
+        assert!(host_is_local("127.0.0.1:49219", "127.0.0.1"));
+    }
+
+    #[test]
+    fn host_is_local_localhost_con_puerto() {
+        assert!(host_is_local("localhost:49219", "127.0.0.1"));
+    }
+
+    #[test]
+    fn host_is_local_ipv6_con_puerto() {
+        assert!(host_is_local("[::1]:49219", "127.0.0.1"));
+    }
+
+    #[test]
+    fn host_is_local_dominio_externo_rechaza() {
+        assert!(!host_is_local("evil.com", "127.0.0.1"));
+    }
+
+    #[test]
+    fn host_is_local_dominio_externo_con_puerto_rechaza() {
+        assert!(!host_is_local("evil.com:49219", "127.0.0.1"));
+    }
+
+    #[test]
+    fn host_is_local_vacio_rechaza() {
+        assert!(!host_is_local("", "127.0.0.1"));
+    }
+
+    #[test]
+    fn host_is_local_subdominio_engañoso_rechaza() {
+        assert!(!host_is_local("localhost.evil.com", "127.0.0.1"));
+    }
+
+    #[test]
+    fn host_is_local_bind_no_estandar_acepta_su_propia_ip() {
+        // Bind loopback no estándar (127.0.0.2): el guard debe aceptar
+        // Host con esa IP, con o sin puerto.
+        assert!(host_is_local("127.0.0.2:49219", "127.0.0.2"));
+        assert!(host_is_local("127.0.0.2", "127.0.0.2"));
+    }
+
+    #[test]
+    fn host_is_local_bind_no_estandar_rechaza_remoto() {
+        assert!(!host_is_local("evil.com", "127.0.0.2"));
+    }
+
+    #[test]
+    fn host_is_local_literal_loopback_siempre_ok() {
+        // "localhost" sigue siendo válido aunque el bind sea 127.0.0.2.
+        assert!(host_is_local("localhost", "127.0.0.2"));
+    }
+
+    // Verificación end-to-end del guard vía un mini-router, sin arrancar
+    // main() completo (que en este entorno se bloquea en el acceso a
+    // Keychain de macOS al abrir la cola; ver reporte de la tarea).
+    #[tokio::test]
+    async fn panel_host_guard_permite_loopback_y_rechaza_spoof() {
+        use tower::ServiceExt;
+
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let bind_ip = "127.0.0.1".to_string();
+        let allow_external = false;
+        let app = Router::new().route("/x", get(ok)).layer(
+            axum::middleware::from_fn(move |req, next| {
+                panel_host_guard(bind_ip.clone(), allow_external, req, next)
+            }),
+        );
+
+        let req_ok = axum::http::Request::builder()
+            .uri("/x")
+            .header("Host", "127.0.0.1:49219")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_ok = app.clone().oneshot(req_ok).await.unwrap();
+        assert_eq!(resp_ok.status(), axum::http::StatusCode::OK);
+
+        let req_spoof = axum::http::Request::builder()
+            .uri("/x")
+            .header("Host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_spoof = app.clone().oneshot(req_spoof).await.unwrap();
+        assert_eq!(resp_spoof.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let req_missing = axum::http::Request::builder()
+            .uri("/x")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_missing = app.clone().oneshot(req_missing).await.unwrap();
+        assert_eq!(resp_missing.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn panel_host_guard_se_omite_con_allow_external() {
+        use tower::ServiceExt;
+
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let bind_ip = "127.0.0.1".to_string();
+        let allow_external = true;
+        let app = Router::new().route("/x", get(ok)).layer(
+            axum::middleware::from_fn(move |req, next| {
+                panel_host_guard(bind_ip.clone(), allow_external, req, next)
+            }),
+        );
+
+        let req_spoof = axum::http::Request::builder()
+            .uri("/x")
+            .header("Host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_spoof = app.clone().oneshot(req_spoof).await.unwrap();
+        assert_eq!(resp_spoof.status(), axum::http::StatusCode::OK);
     }
 }
