@@ -27,6 +27,7 @@ pub struct GcStats {
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", &"WAL")?;
     conn.pragma_update(None, "synchronous", &"NORMAL")?;
     conn.execute_batch(

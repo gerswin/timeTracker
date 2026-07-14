@@ -57,15 +57,18 @@ pub async fn run_heartbeat_loop(
         let last_evt = last_event_ts.load(Ordering::Relaxed);
         let queue_len = match agent_core::queue::Queue::open(paths, &state) {
             Ok(q) => {
-                if let Ok(stats) = q.gc(&gc_cfg) {
-                    if stats.pruned_age > 0 || stats.pruned_attempts > 0 || stats.pruned_overflow > 0 {
-                        info!(
-                            pruned_age = stats.pruned_age,
-                            pruned_attempts = stats.pruned_attempts,
-                            pruned_overflow = stats.pruned_overflow,
-                            "gc de cola: filas eliminadas"
-                        );
+                match q.gc(&gc_cfg) {
+                    Ok(stats) => {
+                        if stats.pruned_age > 0 || stats.pruned_attempts > 0 || stats.pruned_overflow > 0 {
+                            info!(
+                                pruned_age = stats.pruned_age,
+                                pruned_attempts = stats.pruned_attempts,
+                                pruned_overflow = stats.pruned_overflow,
+                                "gc de cola: filas eliminadas"
+                            );
+                        }
                     }
+                    Err(e) => warn!(?e, "gc de cola falló"),
                 }
                 q.queue_len().unwrap_or(0)
             }
@@ -250,32 +253,42 @@ pub async fn run_sender_loop(state: Arc<AgentState>, paths: &Paths) {
                         }
                         Ok(r2) => {
                             warn!(status=?r2.status(), "ingest tras re-bootstrap falló");
-                            if let Err(ie) = q.increment_attempts(&ids) { warn!(?ie, "no se pudo incrementar attempts"); }
+                            sleep(Duration::from_secs(backoff)).await;
+                            backoff = (backoff * 2).min(60);
                         }
                         Err(e2) => {
                             warn!(?e2, "ingest error red tras re-bootstrap");
-                            if let Err(ie) = q.increment_attempts(&ids) { warn!(?ie, "no se pudo incrementar attempts"); }
+                            sleep(Duration::from_secs(backoff)).await;
+                            backoff = (backoff * 2).min(60);
                         }
                     }
                 } else {
                     warn!("re-bootstrap no disponible");
-                    if let Err(ie) = q.increment_attempts(&ids) { warn!(?ie, "no se pudo incrementar attempts"); }
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
                 }
             }
             Ok(resp) if resp.status().as_u16() == 403 => {
                 warn!(status=?resp.status(), "ingest forbidden (403)");
-                if let Err(ie) = q.increment_attempts(&ids) { warn!(?ie, "no se pudo incrementar attempts"); }
                 sleep(Duration::from_secs(backoff)).await; backoff = (backoff*2).min(60);
+            }
+            Ok(resp) if is_payload_rejection(resp.status().as_u16()) => {
+                // El servidor rechaza el payload en sí: reintentar es inútil.
+                // Solo aquí se cuenta el intento, para que el GC por attempts
+                // pode el batch venenoso; los fallos de red/auth/servidor
+                // reintentan sin límite (el tope offline es el GC por edad).
+                warn!(status=?resp.status(), "ingest rechazó el payload; se incrementa attempts");
+                if let Err(ie) = q.increment_attempts(&ids) { warn!(?ie, "no se pudo incrementar attempts"); }
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
             }
             Ok(resp) => {
                 warn!(status=?resp.status(), "envío de eventos falló");
-                if let Err(ie) = q.increment_attempts(&ids) { warn!(?ie, "no se pudo incrementar attempts"); }
                 sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(60);
             }
             Err(e) => {
                 warn!(?e, "error de red al enviar eventos");
-                if let Err(ie) = q.increment_attempts(&ids) { warn!(?ie, "no se pudo incrementar attempts"); }
                 sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(60);
             }
@@ -405,6 +418,12 @@ fn gc_config_from(
         max_rows,
         max_attempts,
     }
+}
+
+/// Estados HTTP que indican que el servidor rechaza el payload en sí
+/// (reintentar el mismo batch es inútil). Solo estos cuentan attempts.
+fn is_payload_rejection(status: u16) -> bool {
+    matches!(status, 400 | 413 | 422)
 }
 
 fn gc_config_from_env() -> agent_core::queue::GcConfig {
@@ -564,5 +583,18 @@ mod tests {
         assert_eq!(cfg.max_age_ms, 14 * 24 * 60 * 60 * 1000);
         assert_eq!(cfg.max_rows, 100_000);
         assert_eq!(cfg.max_attempts, 50);
+    }
+
+    #[test]
+    fn payload_rejection_solo_400_413_422() {
+        assert!(is_payload_rejection(400));
+        assert!(is_payload_rejection(413));
+        assert!(is_payload_rejection(422));
+        // transporte/auth/servidor: reintentar es correcto, no cuentan attempts
+        assert!(!is_payload_rejection(401));
+        assert!(!is_payload_rejection(403));
+        assert!(!is_payload_rejection(429));
+        assert!(!is_payload_rejection(500));
+        assert!(!is_payload_rejection(503));
     }
 }

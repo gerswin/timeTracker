@@ -27,7 +27,7 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 - [x] `agent-ui-windows`: deps y código gateados por `cfg(windows)` + stub main no-Windows — `cargo check --workspace` pasa en macOS por primera vez
 - [x] `agent-login-macos`: member del workspace, `[[bin]]` corregido, código macOS gateado — `macos_pack.sh` completa con RiporHelper.app en el bundle
 - [x] UI inline en `/`: `<script>` roto (SyntaxError, `main.rs:444-501`). **Decidido (D5): eliminar la UI inline** — `/` y `/ui` redirigen a `/panel`, panel embebido en el binario, botón "Refrescar política" pasa a `/panel` (hecho: `/` y `/ui` redirigen, panel embebido; `/panel` está embebido en el binario con override `PANEL_DIR`)
-- [x] Cola: `attempts` se incrementa en fallos de envío (índice añadido); `gc()` por edad/attempts/filas (`QUEUE_MAX_AGE_DAYS`=14, `QUEUE_MAX_ATTEMPTS`=50, `QUEUE_MAX_ROWS`=100000) corre en el loop de heartbeat; filas indescifrables se saltan, borran y loggean (ya no bloquean el sender). Follow-up: safety valve para batch 100% envenenado
+- [x] Cola: `attempts` se incrementa solo en rechazos de payload (400/413/422); outages de red/auth reintentan sin límite de attempts (el tope offline es la edad, 14 días) (índice añadido); `gc()` por edad/attempts/filas (`QUEUE_MAX_AGE_DAYS`=14, `QUEUE_MAX_ATTEMPTS`=50, `QUEUE_MAX_ROWS`=100000) corre en el loop de heartbeat; filas indescifrables se saltan, borran y loggean (ya no bloquean el sender). Follow-up: safety valve para batch 100% envenenado
 - [x] Limpieza: `src/main.rs` raíz borrado; `dist/`, `.DS_Store` y `.superpowers/` fuera de git
 - [x] Reducir warnings: 85 → 60; todo lo restante es ruido de macros del crate `objc` viejo (fix real = dep bump, follow-up)
 
