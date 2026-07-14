@@ -9,27 +9,27 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
 
 ## Estado global (auditoría 2026-07-13)
 - Último commit: 2025-09-18 — proyecto pausado ~10 meses.
-- **Tests: 0 en todo el workspace** (3960 líneas .rs, ningún `#[test]`). Viola la regla de calidad del repo.
-- **Build roto**: `cargo check --workspace` falla en macOS (`winreg` sin cfg gate en agent-ui-windows). Excluyéndolo compila con 88 warnings (100 clippy).
+- Tests: ~~0~~ → **29 unitarios** (2026-07-14: cola, keystore, crypto, redacción, policy, heartbeat, UI embebida).
+- Build: ~~roto~~ → **`cargo check --workspace` pasa en macOS** (2026-07-14, winreg gateado); 60 warnings restantes = 100% ruido de macros del crate `objc` viejo (requiere dep bump).
 - Plan anterior subreportaba Fase 5 (~60-70% hecha) y sobrereportaba items de cola/bootstrap; packaging completo sin trackear.
 - **Decisiones abiertas resueltas el 2026-07-13** (D1-D6): ver `docs/superpowers/specs/2026-07-13-plan-decisions-design.md`.
 
 ## SLOs (métricas objetivo)
 - [ ] CPU p95 ≤ 1% (medido solo macOS idle: p95≈0.13% ✓, `slo_mac.json`; falta Windows y bajo carga; Linux → v2)
 - [ ] RAM p95 ≤ 60 MB (medido solo macOS idle: p95≈16 MB ✓)
-- [ ] Pérdida de eventos < 0.1% (en riesgo: sin GC de cola ni límite de reintentos — ver P0)
+- [ ] Pérdida de eventos < 0.1% (GC y reintentos acotados implementados 2026-07-14; falta medición E2E)
 - [ ] Aplicación de política ≤ 10 s (implementado POLICY_POLL_SECS=10 + fix retry 401; falta verificación E2E con backend real)
 - [ ] MTTR por crash ≤ 5 s (sin watchdog; Fase 6 al 0%)
 
 ---
 
 ## P0 — Arreglos inmediatos (bloquean build/pruebas; antes de cualquier feature)
-- [ ] `agent-ui-windows/Cargo.toml:10`: mover `winreg` a `[target.'cfg(windows)'.dependencies]` — hoy rompe `cargo check --workspace` en macOS/Linux
-- [ ] `agent-login-macos`: agregarlo a workspace members (`Cargo.toml` raíz) y corregir `[bin]` → `[[bin]]` — hoy no compila, rompe `macos_pack.sh` y deja `dist/Ripor.app` sin RiporHelper.app (cadena login-item no testeable)
+- [x] `agent-ui-windows`: deps y código gateados por `cfg(windows)` + stub main no-Windows — `cargo check --workspace` pasa en macOS por primera vez
+- [x] `agent-login-macos`: member del workspace, `[[bin]]` corregido, código macOS gateado — `macos_pack.sh` completa con RiporHelper.app en el bundle
 - [x] UI inline en `/`: `<script>` roto (SyntaxError, `main.rs:444-501`). **Decidido (D5): eliminar la UI inline** — `/` y `/ui` redirigen a `/panel`, panel embebido en el binario, botón "Refrescar política" pasa a `/panel` (hecho: `/` y `/ui` redirigen, panel embebido; `/panel` está embebido en el binario con override `PANEL_DIR`)
-- [ ] Cola: incrementar `attempts` en reintentos + límite de reintentos + GC por tamaño/edad (`queue.rs` — hoy `attempts` es schema muerto; batch fallido reintenta para siempre, cola crece sin límite)
-- [ ] Limpieza: borrar `src/main.rs` raíz ("Hello, world!" muerto), `.gitignore` para `dist/` y `.DS_Store` (hoy hay 4.4 MB de binarios sin firma commiteados)
-- [ ] Reducir warnings (88 compilador / 100 clippy): dead code (`HeartbeatPayload`, `Throttled`, `screen_recording_allowed`), imports sin uso, statics mutables
+- [x] Cola: `attempts` se incrementa en fallos de envío (índice añadido); `gc()` por edad/attempts/filas (`QUEUE_MAX_AGE_DAYS`=14, `QUEUE_MAX_ATTEMPTS`=50, `QUEUE_MAX_ROWS`=100000) corre en el loop de heartbeat; filas indescifrables se saltan, borran y loggean (ya no bloquean el sender). Follow-up: safety valve para batch 100% envenenado
+- [x] Limpieza: `src/main.rs` raíz borrado; `dist/`, `.DS_Store` y `.superpowers/` fuera de git
+- [x] Reducir warnings: 85 → 60; todo lo restante es ruido de macros del crate `objc` viejo (fix real = dep bump, follow-up)
 
 ---
 
@@ -48,8 +48,8 @@ Documento vivo. Estado corregido contra el código real el **2026-07-13** (audit
   - [ ] `FocusAgg` (consolidación, ráfagas, switching rápido — cubre DoD Fase 3)
   - [ ] `Throttle::permit` (token bucket, force_emit, refill — cubre DoD Fase 4)
   - [ ] `drop_reason` (excludeApps/Patterns/ExePaths, killSwitch, pause)
-  - [ ] `crypto` roundtrip (zstd+AES-GCM, AAD device_id)
-  - [ ] Cola: enqueue/peek/delete/attempts/GC
+  - [x] `crypto` roundtrip (zstd+AES-GCM, AAD device_id) + keystore (7 tests)
+  - [x] Cola: enqueue/fetch/delete/attempts/GC/filas envenenadas (6 tests)
 - [ ] E2E mínimo: `smoke.sh` ya existe (build + /healthz + /state + transición ACTIVE/IDLE) — integrarlo como gate; variante Windows `win_smoke.ps1` sin ejercitar
 
 ---
@@ -66,7 +66,7 @@ Tareas
 - [x] Workspace Rust (`agent-core`, `agent-daemon`; luego `agent-cli`, `agent-ui-macos`, `agent-ui-windows`; `agent-login-macos` fuera de members — ver P0)
 - [x] Dependencias: `tokio`, `axum`, `rusqlite`, `serde`, `zstd`, `aes-gcm`, `tracing`, `sysinfo`
 - [x] `deviceId` estable y persistente (`state.rs:16-36`)
-- [ ] Cola `queue.sqlite` (parcial: WAL ✓, índice `created_at` ✓; **falta índice `attempts` y toda la mecánica de reintentos/GC** — ver P0)
+- [x] Cola `queue.sqlite` (WAL ✓, índices `created_at` y `attempts` ✓, reintentos acotados + GC ✓ — cerrado 2026-07-14)
 - [x] Compresión `zstd` + cifrado AES-256-GCM antes de persistir (`crypto.rs:29-44`; clave insegura — ver Seguridad)
 - [x] Panel local `127.0.0.1:49219` con `/healthz`, `/state` (loopback es default, no forzado — ver Seguridad)
 - [x] Logs rotativos diarios + `RUST_LOG` (sin cap de tamaño ni prune de archivos viejos)
@@ -242,7 +242,7 @@ DoD
 ## Inventario real de superficie (antes sin trackear — mantener sincronizado)
 - Endpoints daemon: `/healthz`, `/state`, `/queue`, `/panel` (SPA estática), `/` y `/ui` (inline, rota — P0), `/pause`, `/pause/clear`, `/policy/apply`, `/policy/refresh`, `/focus/blocks`, `/focus/aggregate[.csv]`, `/permissions[/prompt|/open/*]`, `/debug/drops`, `/debug/sample|windows|window|frontmost`
 - CLI: `agent policy show|pull|open|apply|edit|refresh` (faltan: `pause`, `privacy open`, `diag`)
-- Config: `.env` (`API_BASE_URL`, `PANEL_ADDR`, `IDLE_ACTIVE_THRESHOLD_MS`, `RIPOR_NO_AUTO_PROMPT`, `RIPOR_DEBUG_INGEST`, `POLICY_POLL_SECS`, `RIPOR_DEBUG`…) — README documenta vars stale `EVENTS_URL`/`HEARTBEAT_URL`, corregir
+- Config: `.env` (`API_BASE_URL`, `PANEL_ADDR`, `IDLE_ACTIVE_THRESHOLD_MS`, `RIPOR_NO_AUTO_PROMPT`, `RIPOR_DEBUG_INGEST`, `POLICY_POLL_SECS`, `RIPOR_DEBUG`, `QUEUE_MAX_AGE_DAYS`, `QUEUE_MAX_ROWS`, `QUEUE_MAX_ATTEMPTS`…) — README documenta vars stale `EVENTS_URL`/`HEARTBEAT_URL`, corregir
 - Scripts: `smoke.sh`, `slo_idle_check.py|.sh`, `win_run.ps1`, `win_smoke.ps1`, `macos_pack|sign|notarize.sh`
 
 ---
